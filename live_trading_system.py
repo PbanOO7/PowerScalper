@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -128,6 +129,9 @@ class Position:
 # Broker abstraction
 # -----------------------------
 class BrokerInterface:
+    def status(self) -> tuple[bool, str]:
+        raise NotImplementedError
+
     def place_order(self, side: SignalSide, qty: int, option_symbol: str, mode: TradeMode) -> dict:
         raise NotImplementedError
 
@@ -136,6 +140,9 @@ class BrokerInterface:
 
 
 class PaperBroker(BrokerInterface):
+    def status(self) -> tuple[bool, str]:
+        return True, "Paper execution ready."
+
     def place_order(self, side: SignalSide, qty: int, option_symbol: str, mode: TradeMode) -> dict:
         return {
             "status": "paper_filled",
@@ -171,22 +178,67 @@ class DhanBroker(BrokerInterface):
     """
 
     def __init__(self, client_id: Optional[str] = None, access_token: Optional[str] = None):
-        self.client_id = client_id
-        self.access_token = access_token
+        self.client_id = client_id or self._read_secret("dhan", "client_id") or os.getenv("DHAN_CLIENT_ID")
+        self.access_token = access_token or self._read_secret("dhan", "access_token") or os.getenv("DHAN_ACCESS_TOKEN")
+
+    @staticmethod
+    def _read_secret(section: str, key: str) -> Optional[str]:
+        try:
+            if section in st.secrets and key in st.secrets[section]:
+                value = st.secrets[section][key]
+                return str(value).strip() if value else None
+        except Exception:
+            pass
+        return None
+
+    def status(self) -> tuple[bool, str]:
+        if not self.client_id or not self.access_token:
+            return False, (
+                "Missing Dhan credentials. Add [dhan].client_id and [dhan].access_token "
+                "to Streamlit secrets or set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN."
+            )
+        return True, "Credentials loaded. Instrument resolution and real order APIs still need to be implemented."
+
+    def preview_order_payload(self, side: SignalSide, qty: int, option_symbol: str) -> dict:
+        return {
+            "broker": "dhan",
+            "side": side,
+            "qty": qty,
+            "option_symbol": option_symbol,
+            "order_type": "MARKET",
+            "product_type": "INTRADAY",
+        }
 
     def place_order(self, side: SignalSide, qty: int, option_symbol: str, mode: TradeMode) -> dict:
         if mode != "LIVE":
             return {"status": "blocked", "reason": "LIVE mode not enabled"}
-        raise NotImplementedError(
-            "Wire your Dhan place_order here. Use client_id/access_token, resolve option symbol, then place the order."
-        )
+        ready, reason = self.status()
+        if not ready:
+            raise RuntimeError(reason)
+        return {
+            "status": "not_implemented",
+            "reason": "Dhan credentials are loaded, but option symbol to security_id resolution and live order placement are not wired yet.",
+            "preview": self.preview_order_payload(side, qty, option_symbol),
+            "timestamp": datetime.now().isoformat(),
+        }
 
     def exit_order(self, option_symbol: str, qty: int, mode: TradeMode) -> dict:
         if mode != "LIVE":
             return {"status": "blocked", "reason": "LIVE mode not enabled"}
-        raise NotImplementedError(
-            "Wire your Dhan exit_order here. Resolve option symbol/security_id and exit the open position."
-        )
+        ready, reason = self.status()
+        if not ready:
+            raise RuntimeError(reason)
+        return {
+            "status": "not_implemented",
+            "reason": "Dhan credentials are loaded, but live exit routing is not wired yet.",
+            "preview": {
+                "broker": "dhan",
+                "option_symbol": option_symbol,
+                "qty": qty,
+                "order_type": "MARKET",
+            },
+            "timestamp": datetime.now().isoformat(),
+        }
 
 
 # -----------------------------
@@ -683,10 +735,17 @@ def main() -> None:
     )
 
     broker: BrokerInterface = PaperBroker() if mode == "PAPER" else DhanBroker()
+    live_ready, live_reason = broker.status()
 
     live_tab, backtest_tab, notes_tab = st.tabs(["Live Signals", "Backtest", "Live Wiring Notes"])
 
     with live_tab:
+        if mode == "LIVE":
+            if live_ready:
+                st.info(f"LIVE broker status: {live_reason}")
+            else:
+                st.error(f"LIVE broker status: {live_reason}")
+
         price_df = load_price_data(cfg.symbol, cfg.bar_interval, cfg.history_period)
         vix_df = load_vix_data(cfg.vix_symbol)
 
@@ -740,24 +799,27 @@ def main() -> None:
                 st.write(f"**Risk Check:** {reason}")
 
                 signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
-                can_fire = ok and signal_key != st.session_state.last_signal_key
+                can_fire = ok and signal_key != st.session_state.last_signal_key and (mode == "PAPER" or live_ready)
                 if st.button(f"Execute {mode} Order", disabled=not can_fire):
                     try:
                         resp = broker.place_order(signal.side, qty, option_symbol, mode)
-                        st.session_state.last_signal_key = signal_key
-                        st.session_state.positions.append(Position(
-                            side=signal.side,
-                            entry=signal.entry,
-                            stop_loss=signal.stop_loss,
-                            target=signal.target,
-                            qty=qty,
-                            opened_at=datetime.now(),
-                            mode=mode,
-                            reason=signal.reason,
-                            option_symbol=option_symbol,
-                        ))
                         st.session_state.trade_log.append(resp)
-                        st.success(f"Order sent: {resp}")
+                        if resp.get("status") in {"paper_filled", "filled", "success"}:
+                            st.session_state.last_signal_key = signal_key
+                            st.session_state.positions.append(Position(
+                                side=signal.side,
+                                entry=signal.entry,
+                                stop_loss=signal.stop_loss,
+                                target=signal.target,
+                                qty=qty,
+                                opened_at=datetime.now(),
+                                mode=mode,
+                                reason=signal.reason,
+                                option_symbol=option_symbol,
+                            ))
+                            st.success(f"Order sent: {resp}")
+                        else:
+                            st.warning(f"Order was not placed: {resp}")
                     except Exception as exc:
                         st.error(f"Execution failed: {exc}")
 
@@ -787,14 +849,19 @@ def main() -> None:
             exit_index = st.number_input("Exit position #", min_value=0, max_value=max(len(st.session_state.positions) - 1, 0), value=0, step=1)
             if st.button("Exit Selected Position"):
                 if 0 <= exit_index < len(st.session_state.positions):
-                    pos = st.session_state.positions.pop(exit_index)
+                    pos = st.session_state.positions[exit_index]
                     try:
                         resp = broker.exit_order(pos.option_symbol, pos.qty, pos.mode)
-                        current_spot = float(price_df["Close"].iloc[-1])
-                        realized = (current_spot - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - current_spot) * pos.qty
-                        st.session_state.daily_pnl += realized
-                        st.session_state.trade_log.append({**resp, "realized_pnl": realized})
-                        st.success(f"Exited. Realized P&L: ₹{realized:,.2f}")
+                        if resp.get("status") in {"paper_exit", "exited", "success"}:
+                            st.session_state.positions.pop(exit_index)
+                            current_spot = float(price_df["Close"].iloc[-1])
+                            realized = (current_spot - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - current_spot) * pos.qty
+                            st.session_state.daily_pnl += realized
+                            st.session_state.trade_log.append({**resp, "realized_pnl": realized})
+                            st.success(f"Exited. Realized P&L: ₹{realized:,.2f}")
+                        else:
+                            st.session_state.trade_log.append(resp)
+                            st.warning(f"Exit was not placed: {resp}")
                     except Exception as exc:
                         st.error(f"Exit failed: {exc}")
 
@@ -860,20 +927,26 @@ def main() -> None:
         st.markdown("### Dhan live execution wiring")
         st.code(
             """
-1. Add your credentials to Streamlit secrets:
+1. Add your credentials to Streamlit secrets or environment variables:
    [dhan]
    client_id = "YOUR_CLIENT_ID"
    access_token = "YOUR_ACCESS_TOKEN"
 
-2. In DhanBroker.__init__ load them:
-   self.client_id = st.secrets['dhan']['client_id']
-   self.access_token = st.secrets['dhan']['access_token']
+   or
 
-3. Resolve option_symbol to a broker tradable instrument/security id.
+   DHAN_CLIENT_ID=YOUR_CLIENT_ID
+   DHAN_ACCESS_TOKEN=YOUR_ACCESS_TOKEN
 
-4. Implement:
+2. Resolve option_symbol to a broker tradable instrument/security id.
+
+3. Implement:
    - place_order(side, qty, option_symbol, mode)
    - exit_order(option_symbol, qty, mode)
+
+4. Optional next step:
+   - replace the preview payload with real Dhan API requests
+   - persist broker order ids in session state or storage
+   - fetch broker positions and LTP instead of using spot-based P&L
 
 5. Keep PAPER mode until:
    - strike mapping is verified

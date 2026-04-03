@@ -3,12 +3,15 @@ from __future__ import annotations
 import math
 import os
 import time
+import io
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Literal
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -38,6 +41,9 @@ INSTRUMENTS = {
     "NIFTY 50": {
         "symbol": "^NSEI",
         "option_prefix": "NIFTY",
+        "underlying_symbol": "NIFTY",
+        "order_exchange_segment": "NSE_FNO",
+        "underlying_exchange_segment": "IDX_I",
         "lot_size": 65,
         "strike_step": 50,
         "expiry_weekday": 1,
@@ -45,6 +51,9 @@ INSTRUMENTS = {
     "BANKNIFTY": {
         "symbol": "^NSEBANK",
         "option_prefix": "BANKNIFTY",
+        "underlying_symbol": "BANKNIFTY",
+        "order_exchange_segment": "NSE_FNO",
+        "underlying_exchange_segment": "IDX_I",
         "lot_size": 30,
         "strike_step": 100,
         "expiry_weekday": 1,
@@ -52,6 +61,9 @@ INSTRUMENTS = {
     "FINNIFTY": {
         "symbol": "NIFTY_FIN_SERVICE.NS",
         "option_prefix": "FINNIFTY",
+        "underlying_symbol": "FINNIFTY",
+        "order_exchange_segment": "NSE_FNO",
+        "underlying_exchange_segment": "IDX_I",
         "lot_size": 60,
         "strike_step": 50,
         "expiry_weekday": 1,
@@ -59,6 +71,9 @@ INSTRUMENTS = {
     "SENSEX": {
         "symbol": "^BSESN",
         "option_prefix": "SENSEX",
+        "underlying_symbol": "SENSEX",
+        "order_exchange_segment": "BSE_FNO",
+        "underlying_exchange_segment": "IDX_I",
         "lot_size": 20,
         "strike_step": 100,
         "expiry_weekday": 3,
@@ -71,6 +86,9 @@ class StrategyConfig:
     symbol: str = "^NSEI"
     instrument_name: str = "NIFTY 50"
     option_prefix: str = "NIFTY"
+    underlying_symbol: str = "NIFTY"
+    order_exchange_segment: str = "NSE_FNO"
+    underlying_exchange_segment: str = "IDX_I"
     vix_symbol: str = "^INDIAVIX"
     bar_interval: str = "5m"
     history_period: str = "10d"
@@ -122,6 +140,9 @@ class Position:
     mode: TradeMode
     reason: str
     option_symbol: str
+    security_id: Optional[str] = None
+    exchange_segment: Optional[str] = None
+    order_id: Optional[str] = None
     trailing_active: bool = False
 
 
@@ -177,9 +198,12 @@ class DhanBroker(BrokerInterface):
     5. Use broker LTP for real P&L and exits
     """
 
+    base_url = "https://api.dhan.co/v2"
+
     def __init__(self, client_id: Optional[str] = None, access_token: Optional[str] = None):
         self.client_id = client_id or self._read_secret("dhan", "client_id") or os.getenv("DHAN_CLIENT_ID")
         self.access_token = access_token or self._read_secret("dhan", "access_token") or os.getenv("DHAN_ACCESS_TOKEN")
+        self._profile_cache: Optional[dict] = None
 
     @staticmethod
     def _read_secret(section: str, key: str) -> Optional[str]:
@@ -191,20 +215,121 @@ class DhanBroker(BrokerInterface):
             pass
         return None
 
+    def _headers(self, include_client_id: bool = False) -> dict:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "access-token": self.access_token or "",
+        }
+        if include_client_id:
+            headers["client-id"] = self.client_id or ""
+        return headers
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Optional[dict] = None,
+        include_client_id: bool = False,
+    ) -> dict:
+        resp = requests.request(
+            method,
+            f"{self.base_url}{path}",
+            headers=self._headers(include_client_id=include_client_id),
+            json=payload,
+            timeout=30,
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        if not resp.ok:
+            detail = data.get("message") or data.get("remarks") or data.get("errorCode") or resp.text
+            raise RuntimeError(f"Dhan API error {resp.status_code}: {detail}")
+        return data
+
+    @staticmethod
+    def _parse_option_symbol(option_symbol: str) -> tuple[str, datetime.date, int, str]:
+        try:
+            prefix, expiry_code, strike, side = option_symbol.split("_")
+            expiry_date = datetime.strptime(expiry_code.upper(), "%d%b%y").date()
+            return prefix.upper(), expiry_date, int(strike), side.upper()
+        except ValueError as exc:
+            raise RuntimeError(f"Unsupported option symbol format: {option_symbol}") from exc
+
+    def _instrument_meta_from_prefix(self, option_prefix: str) -> dict:
+        for instrument in INSTRUMENTS.values():
+            if instrument["option_prefix"].upper() == option_prefix.upper():
+                return instrument
+        raise RuntimeError(f"No Dhan instrument metadata configured for option prefix `{option_prefix}`.")
+
+    def resolve_option_contract(self, option_symbol: str) -> dict:
+        option_prefix, expiry_date, strike, side = self._parse_option_symbol(option_symbol)
+        meta = self._instrument_meta_from_prefix(option_prefix)
+        instruments = load_dhan_instrument_master()
+        match = instruments[
+            (instruments["UNDERLYING_SYMBOL"] == meta["underlying_symbol"])
+            & (instruments["SM_EXPIRY_DATE"] == expiry_date)
+            & (instruments["STRIKE_PRICE"] == float(strike))
+            & (instruments["OPTION_TYPE"] == side)
+        ]
+        if match.empty:
+            raise RuntimeError(
+                f"No Dhan contract found for {option_symbol}. "
+                "Check the expiry code, strike step, and whether the contract exists in Dhan's instrument master."
+            )
+        row = match.iloc[0]
+        return {
+            "security_id": str(row["SECURITY_ID"]),
+            "exchange_segment": meta["order_exchange_segment"],
+            "underlying_symbol": meta["underlying_symbol"],
+            "expiry_date": str(expiry_date),
+            "strike_price": strike,
+            "option_type": side,
+            "lot_size": int(float(row["LOT_SIZE"])),
+        }
+
+    def get_ltp(self, security_id: str, exchange_segment: str) -> float:
+        data = self._request(
+            "POST",
+            "/marketfeed/ltp",
+            payload={exchange_segment: [int(security_id)]},
+            include_client_id=True,
+        )
+        segment_data = data.get("data", {}).get(exchange_segment, {})
+        quote = segment_data.get(str(security_id), {})
+        price = quote.get("last_price")
+        if price is None:
+            raise RuntimeError(f"No LTP returned for security_id {security_id} in segment {exchange_segment}.")
+        return float(price)
+
     def status(self) -> tuple[bool, str]:
         if not self.client_id or not self.access_token:
             return False, (
                 "Missing Dhan credentials. Add [dhan].client_id and [dhan].access_token "
                 "to Streamlit secrets or set DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN."
             )
-        return True, "Credentials loaded. Instrument resolution and real order APIs still need to be implemented."
+        try:
+            if self._profile_cache is None:
+                self._profile_cache = self._request("GET", "/profile")
+            client = self._profile_cache.get("dhanClientId", self.client_id)
+            return True, (
+                f"Authenticated with Dhan client {client}. "
+                "Order APIs may still require a Dhan-whitelisted static IP at runtime."
+            )
+        except Exception as exc:
+            return False, f"Dhan authentication failed: {exc}"
 
     def preview_order_payload(self, side: SignalSide, qty: int, option_symbol: str) -> dict:
+        contract = self.resolve_option_contract(option_symbol)
         return {
             "broker": "dhan",
-            "side": side,
+            "transactionType": "BUY",
             "qty": qty,
             "option_symbol": option_symbol,
+            "securityId": contract["security_id"],
+            "exchangeSegment": contract["exchange_segment"],
             "order_type": "MARKET",
             "product_type": "INTRADAY",
         }
@@ -215,11 +340,35 @@ class DhanBroker(BrokerInterface):
         ready, reason = self.status()
         if not ready:
             raise RuntimeError(reason)
+        contract = self.resolve_option_contract(option_symbol)
+        payload = {
+            "dhanClientId": self.client_id,
+            "correlationId": f"{contract['underlying_symbol'][:8]}-{uuid.uuid4().hex[:20]}",
+            "transactionType": "BUY",
+            "exchangeSegment": contract["exchange_segment"],
+            "productType": "INTRADAY",
+            "orderType": "MARKET",
+            "validity": "DAY",
+            "securityId": contract["security_id"],
+            "quantity": int(qty),
+            "disclosedQuantity": 0,
+            "price": 0,
+            "triggerPrice": 0,
+            "afterMarketOrder": False,
+            "amoTime": "OPEN",
+        }
+        data = self._request("POST", "/orders", payload=payload)
         return {
-            "status": "not_implemented",
-            "reason": "Dhan credentials are loaded, but option symbol to security_id resolution and live order placement are not wired yet.",
-            "preview": self.preview_order_payload(side, qty, option_symbol),
+            "status": "accepted",
+            "broker_status": data.get("orderStatus"),
+            "order_id": data.get("orderId"),
+            "transactionType": "BUY",
+            "qty": qty,
+            "symbol": option_symbol,
+            "security_id": contract["security_id"],
+            "exchange_segment": contract["exchange_segment"],
             "timestamp": datetime.now().isoformat(),
+            "raw": data,
         }
 
     def exit_order(self, option_symbol: str, qty: int, mode: TradeMode) -> dict:
@@ -228,16 +377,35 @@ class DhanBroker(BrokerInterface):
         ready, reason = self.status()
         if not ready:
             raise RuntimeError(reason)
+        contract = self.resolve_option_contract(option_symbol)
+        payload = {
+            "dhanClientId": self.client_id,
+            "correlationId": f"EXIT-{uuid.uuid4().hex[:20]}",
+            "transactionType": "SELL",
+            "exchangeSegment": contract["exchange_segment"],
+            "productType": "INTRADAY",
+            "orderType": "MARKET",
+            "validity": "DAY",
+            "securityId": contract["security_id"],
+            "quantity": int(qty),
+            "disclosedQuantity": 0,
+            "price": 0,
+            "triggerPrice": 0,
+            "afterMarketOrder": False,
+            "amoTime": "OPEN",
+        }
+        data = self._request("POST", "/orders", payload=payload)
         return {
-            "status": "not_implemented",
-            "reason": "Dhan credentials are loaded, but live exit routing is not wired yet.",
-            "preview": {
-                "broker": "dhan",
-                "option_symbol": option_symbol,
-                "qty": qty,
-                "order_type": "MARKET",
-            },
+            "status": "accepted",
+            "broker_status": data.get("orderStatus"),
+            "order_id": data.get("orderId"),
+            "transactionType": "SELL",
+            "qty": qty,
+            "symbol": option_symbol,
+            "security_id": contract["security_id"],
+            "exchange_segment": contract["exchange_segment"],
             "timestamp": datetime.now().isoformat(),
+            "raw": data,
         }
 
 
@@ -654,6 +822,33 @@ def load_vix_data(symbol: str = "^INDIAVIX", period: str = "1y") -> pd.DataFrame
     return df.dropna().copy()
 
 
+@st.cache_data(ttl=3600)
+def load_dhan_instrument_master() -> pd.DataFrame:
+    url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+    cols = [
+        "EXCH_ID",
+        "SEGMENT",
+        "SECURITY_ID",
+        "UNDERLYING_SECURITY_ID",
+        "UNDERLYING_SYMBOL",
+        "DISPLAY_NAME",
+        "LOT_SIZE",
+        "SM_EXPIRY_DATE",
+        "STRIKE_PRICE",
+        "OPTION_TYPE",
+        "EXPIRY_FLAG",
+    ]
+    df = pd.read_csv(io.StringIO(resp.text), usecols=cols, low_memory=False)
+    df["UNDERLYING_SYMBOL"] = df["UNDERLYING_SYMBOL"].astype(str).str.upper()
+    df["OPTION_TYPE"] = df["OPTION_TYPE"].astype(str).str.upper()
+    df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce").dt.date
+    df["STRIKE_PRICE"] = pd.to_numeric(df["STRIKE_PRICE"], errors="coerce")
+    df["SECURITY_ID"] = df["SECURITY_ID"].astype("Int64").astype(str)
+    return df
+
+
 def supported_backtest_periods(interval: str) -> list[str]:
     # Yahoo Finance intraday intervals are limited to roughly the last 60 days.
     if interval in {"5m", "15m", "30m"}:
@@ -721,6 +916,9 @@ def main() -> None:
         symbol=instrument["symbol"],
         instrument_name=instrument_name,
         option_prefix=instrument["option_prefix"],
+        underlying_symbol=instrument["underlying_symbol"],
+        order_exchange_segment=instrument["order_exchange_segment"],
+        underlying_exchange_segment=instrument["underlying_exchange_segment"],
         lot_size=instrument["lot_size"],
         strike_step=instrument["strike_step"],
         bar_interval=interval,
@@ -804,11 +1002,22 @@ def main() -> None:
                     try:
                         resp = broker.place_order(signal.side, qty, option_symbol, mode)
                         st.session_state.trade_log.append(resp)
-                        if resp.get("status") in {"paper_filled", "filled", "success"}:
+                        if resp.get("status") in {"paper_filled", "filled", "success", "accepted"}:
                             st.session_state.last_signal_key = signal_key
+                            entry_price = signal.entry
+                            if (
+                                mode == "LIVE"
+                                and isinstance(broker, DhanBroker)
+                                and resp.get("security_id")
+                                and resp.get("exchange_segment")
+                            ):
+                                try:
+                                    entry_price = broker.get_ltp(resp["security_id"], resp["exchange_segment"])
+                                except Exception:
+                                    entry_price = signal.entry
                             st.session_state.positions.append(Position(
                                 side=signal.side,
-                                entry=signal.entry,
+                                entry=entry_price,
                                 stop_loss=signal.stop_loss,
                                 target=signal.target,
                                 qty=qty,
@@ -816,6 +1025,9 @@ def main() -> None:
                                 mode=mode,
                                 reason=signal.reason,
                                 option_symbol=option_symbol,
+                                security_id=resp.get("security_id"),
+                                exchange_segment=resp.get("exchange_segment"),
+                                order_id=resp.get("order_id"),
                             ))
                             st.success(f"Order sent: {resp}")
                         else:
@@ -830,7 +1042,21 @@ def main() -> None:
             current_spot = float(price_df["Close"].iloc[-1])
             rows = []
             for idx, pos in enumerate(st.session_state.positions):
-                pnl = (current_spot - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - current_spot) * pos.qty
+                mark_price = current_spot
+                price_label = "Spot"
+                if (
+                    pos.mode == "LIVE"
+                    and isinstance(broker, DhanBroker)
+                    and live_ready
+                    and pos.security_id
+                    and pos.exchange_segment
+                ):
+                    try:
+                        mark_price = broker.get_ltp(pos.security_id, pos.exchange_segment)
+                        price_label = "Option LTP"
+                    except Exception:
+                        mark_price = current_spot
+                pnl = (mark_price - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - mark_price) * pos.qty
                 rows.append({
                     "#": idx,
                     "Side": pos.side,
@@ -840,7 +1066,9 @@ def main() -> None:
                     "Qty": pos.qty,
                     "Mode": pos.mode,
                     "Option": pos.option_symbol,
+                    "Security ID": pos.security_id,
                     "Opened": pos.opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "Mark Source": price_label,
                     "Est. PnL": round(pnl, 2),
                     "Reason": pos.reason[:120],
                 })
@@ -852,10 +1080,21 @@ def main() -> None:
                     pos = st.session_state.positions[exit_index]
                     try:
                         resp = broker.exit_order(pos.option_symbol, pos.qty, pos.mode)
-                        if resp.get("status") in {"paper_exit", "exited", "success"}:
+                        if resp.get("status") in {"paper_exit", "exited", "success", "accepted"}:
                             st.session_state.positions.pop(exit_index)
-                            current_spot = float(price_df["Close"].iloc[-1])
-                            realized = (current_spot - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - current_spot) * pos.qty
+                            exit_mark = float(price_df["Close"].iloc[-1])
+                            if (
+                                pos.mode == "LIVE"
+                                and isinstance(broker, DhanBroker)
+                                and live_ready
+                                and pos.security_id
+                                and pos.exchange_segment
+                            ):
+                                try:
+                                    exit_mark = broker.get_ltp(pos.security_id, pos.exchange_segment)
+                                except Exception:
+                                    exit_mark = float(price_df["Close"].iloc[-1])
+                            realized = (exit_mark - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - exit_mark) * pos.qty
                             st.session_state.daily_pnl += realized
                             st.session_state.trade_log.append({**resp, "realized_pnl": realized})
                             st.success(f"Exited. Realized P&L: ₹{realized:,.2f}")
@@ -1013,15 +1252,16 @@ def main() -> None:
    DHAN_ACCESS_TOKEN=YOUR_ACCESS_TOKEN
 
 2. Resolve option_symbol to a broker tradable instrument/security id.
+   - This app now uses Dhan's official instrument master CSV for that mapping.
 
 3. Implement:
-   - place_order(side, qty, option_symbol, mode)
-   - exit_order(option_symbol, qty, mode)
+   - monitor postbacks or poll order book for final trade status
+   - persist live positions/order ids beyond Streamlit session state
 
 4. Optional next step:
-   - replace the preview payload with real Dhan API requests
-   - persist broker order ids in session state or storage
-   - fetch broker positions and LTP instead of using spot-based P&L
+   - fetch order book / positions from Dhan instead of relying on local session state
+   - use postbacks or websocket/live order updates for fills
+   - add static IP whitelisting if your Dhan account requires it
 
 5. Keep PAPER mode until:
    - strike mapping is verified

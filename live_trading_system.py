@@ -562,6 +562,13 @@ def load_vix_data(symbol: str = "^INDIAVIX", period: str = "1y") -> pd.DataFrame
     return df.dropna().copy()
 
 
+def supported_backtest_periods(interval: str) -> list[str]:
+    # Yahoo Finance intraday intervals are limited to roughly the last 60 days.
+    if interval in {"5m", "15m", "30m"}:
+        return ["5d", "1mo"]
+    return ["1mo", "3mo", "6mo"]
+
+
 # -----------------------------
 # Session state
 # -----------------------------
@@ -741,33 +748,46 @@ def main() -> None:
     with backtest_tab:
         st.markdown("### Backtest Engine")
         bt_interval = st.selectbox("Backtest interval", ["5m", "15m", "30m"], index=0, key="bt_interval")
-        bt_period = st.selectbox("Backtest period", ["1mo", "3mo", "6mo"], index=1, key="bt_period")
+        bt_period_options = supported_backtest_periods(bt_interval)
+        default_bt_period = "1mo" if "1mo" in bt_period_options else bt_period_options[0]
+        bt_period = st.selectbox(
+            "Backtest period",
+            bt_period_options,
+            index=bt_period_options.index(default_bt_period),
+            key="bt_period",
+        )
         run_bt = st.button("Run Backtest", use_container_width=True)
 
         if run_bt:
             bt_price = load_price_data(cfg.symbol, bt_interval, bt_period)
             bt_vix = load_vix_data(cfg.vix_symbol)
             bt_cfg = StrategyConfig(**{**cfg.__dict__, "bar_interval": bt_interval, "history_period": bt_period})
-            with st.spinner("Running backtest..."):
-                trades_df, stats = backtest_strategy(bt_price, bt_vix, bt_cfg, capital)
-            if not stats:
-                st.warning("No backtest output.")
+            if bt_price.empty:
+                st.warning(
+                    f"No backtest price data was returned for interval `{bt_interval}` and period `{bt_period}`. "
+                    "Yahoo Finance only provides intraday data for a limited recent window."
+                )
             else:
-                k1, k2, k3, k4, k5 = st.columns(5)
-                k1.metric("Trades", stats["total_trades"])
-                k2.metric("Win Rate", f"{stats['win_rate'] * 100:.1f}%")
-                k3.metric("Net P&L", f"₹{stats['net_pnl']:,.2f}")
-                k4.metric("Return", f"{stats['return_pct'] * 100:.2f}%")
-                pf = stats['profit_factor'] if math.isfinite(stats['profit_factor']) else 999.0
-                k5.metric("Profit Factor", f"{pf:.2f}")
-                st.write(f"**Max Drawdown:** {stats['max_drawdown_pct'] * 100:.2f}%")
-                if not trades_df.empty:
-                    st.dataframe(trades_df.tail(100), use_container_width=True)
-                    equity = trades_df[["exit_time", "capital_after"]].copy()
-                    equity = equity.set_index("exit_time")
-                    st.line_chart(equity)
+                with st.spinner("Running backtest..."):
+                    trades_df, stats = backtest_strategy(bt_price, bt_vix, bt_cfg, capital)
+                if not stats:
+                    st.warning("No backtest output.")
                 else:
-                    st.info("No trades generated in the selected backtest window.")
+                    k1, k2, k3, k4, k5 = st.columns(5)
+                    k1.metric("Trades", stats["total_trades"])
+                    k2.metric("Win Rate", f"{stats['win_rate'] * 100:.1f}%")
+                    k3.metric("Net P&L", f"₹{stats['net_pnl']:,.2f}")
+                    k4.metric("Return", f"{stats['return_pct'] * 100:.2f}%")
+                    pf = stats['profit_factor'] if math.isfinite(stats['profit_factor']) else 999.0
+                    k5.metric("Profit Factor", f"{pf:.2f}")
+                    st.write(f"**Max Drawdown:** {stats['max_drawdown_pct'] * 100:.2f}%")
+                    if not trades_df.empty:
+                        st.dataframe(trades_df.tail(100), use_container_width=True)
+                        equity = trades_df[["exit_time", "capital_after"]].copy()
+                        equity = equity.set_index("exit_time")
+                        st.line_chart(equity)
+                    else:
+                        st.info("No trades generated in the selected backtest window.")
 
     with notes_tab:
         st.markdown("### Dhan live execution wiring")

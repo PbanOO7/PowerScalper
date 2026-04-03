@@ -33,10 +33,43 @@ TradeMode = Literal["PAPER", "LIVE"]
 SignalSide = Literal["CE", "PE"]
 Regime = Literal["TRENDING", "RANGE", "VOLATILE"]
 
+INSTRUMENTS = {
+    "NIFTY 50": {
+        "symbol": "^NSEI",
+        "option_prefix": "NIFTY",
+        "lot_size": 65,
+        "strike_step": 50,
+        "expiry_weekday": 1,
+    },
+    "BANKNIFTY": {
+        "symbol": "^NSEBANK",
+        "option_prefix": "BANKNIFTY",
+        "lot_size": 30,
+        "strike_step": 100,
+        "expiry_weekday": 1,
+    },
+    "FINNIFTY": {
+        "symbol": "NIFTY_FIN_SERVICE.NS",
+        "option_prefix": "FINNIFTY",
+        "lot_size": 60,
+        "strike_step": 50,
+        "expiry_weekday": 1,
+    },
+    "SENSEX": {
+        "symbol": "^BSESN",
+        "option_prefix": "SENSEX",
+        "lot_size": 20,
+        "strike_step": 100,
+        "expiry_weekday": 3,
+    },
+}
+
 
 @dataclass
 class StrategyConfig:
     symbol: str = "^NSEI"
+    instrument_name: str = "NIFTY 50"
+    option_prefix: str = "NIFTY"
     vix_symbol: str = "^INDIAVIX"
     bar_interval: str = "5m"
     history_period: str = "10d"
@@ -251,14 +284,21 @@ def choose_strike(spot: float, side: SignalSide, mode: str, step: int) -> int:
     return atm
 
 
-def make_option_symbol(spot: float, side: SignalSide, expiry_code: str, strike_mode: str, step: int) -> str:
+def make_option_symbol(
+    spot: float,
+    side: SignalSide,
+    expiry_code: str,
+    strike_mode: str,
+    step: int,
+    option_prefix: str,
+) -> str:
     strike = choose_strike(spot, side, strike_mode, step)
-    return f"NIFTY_{expiry_code}_{strike}_{side}"
+    return f"{option_prefix}_{expiry_code}_{strike}_{side}"
 
 
-def infer_nearest_weekly_expiry(now: Optional[datetime] = None) -> str:
+def infer_nearest_weekly_expiry(now: Optional[datetime] = None, expiry_weekday: int = 3) -> str:
     now = now or datetime.now()
-    days_ahead = (3 - now.weekday()) % 7
+    days_ahead = (expiry_weekday - now.weekday()) % 7
     expiry = now + timedelta(days=days_ahead)
     return expiry.strftime("%d%b%y").upper()
 
@@ -589,11 +629,17 @@ def init_state() -> None:
 def main() -> None:
     init_state()
 
-    st.title("NIFTY Live Trading System")
+    st.title("Index Live Trading System")
     st.caption("Live CE/PE signal engine + strike selection + backtest engine + Dhan execution scaffold.")
 
     with st.sidebar:
         st.header("Trading Controls")
+        instrument_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), index=0)
+        instrument = INSTRUMENTS[instrument_name]
+        inferred_expiry = infer_nearest_weekly_expiry(expiry_weekday=instrument["expiry_weekday"])
+        if st.session_state.get("expiry_instrument") != instrument_name:
+            st.session_state.expiry_code_input = inferred_expiry
+            st.session_state.expiry_instrument = instrument_name
         mode: TradeMode = st.radio("Trading Mode", ["PAPER", "LIVE"], index=0, horizontal=True)
         if mode == "LIVE":
             st.warning("⚠️ LIVE MODE ENABLED: Real trades will be executed. Start with small capital.")
@@ -606,11 +652,25 @@ def main() -> None:
         interval = st.selectbox("Live bar interval", ["5m", "15m", "30m"], index=0)
         period = st.selectbox("Live history period", ["5d", "10d", "1mo"], index=1)
         strike_mode = st.selectbox("Strike selection", ["ATM", "ITM1", "OTM1"], index=0)
-        expiry_code = st.text_input("Expiry code", value=infer_nearest_weekly_expiry())
+        expiry_label = "Tuesday" if instrument["expiry_weekday"] == 1 else "Thursday"
+        expiry_code = st.text_input(
+            "Expiry code",
+            key="expiry_code_input",
+            help=f"Default weekly expiry is based on {instrument_name}'s usual {expiry_label} expiry cycle.",
+        )
+        st.caption(
+            f"Lot size: {instrument['lot_size']} | Strike step: {instrument['strike_step']} | "
+            f"Yahoo symbol: `{instrument['symbol']}`"
+        )
         refresh = st.button("Refresh Signals", use_container_width=True)
         auto_refresh = st.checkbox("Auto-refresh every 60 sec", value=False)
 
     cfg = StrategyConfig(
+        symbol=instrument["symbol"],
+        instrument_name=instrument_name,
+        option_prefix=instrument["option_prefix"],
+        lot_size=instrument["lot_size"],
+        strike_step=instrument["strike_step"],
         bar_interval=interval,
         history_period=period,
         risk_per_trade_pct=risk_pct,
@@ -631,7 +691,7 @@ def main() -> None:
         vix_df = load_vix_data(cfg.vix_symbol)
 
         if price_df.empty:
-            st.error("Could not load NIFTY data.")
+            st.error(f"Could not load {cfg.instrument_name} data for Yahoo symbol `{cfg.symbol}`.")
             return
 
         if vix_df.empty:
@@ -655,7 +715,14 @@ def main() -> None:
         if signal is None:
             st.info("No valid CE/PE setup right now. Stay flat.")
         else:
-            option_symbol = make_option_symbol(signal.entry, signal.side, expiry_code, cfg.option_moneyness, cfg.strike_step)
+            option_symbol = make_option_symbol(
+                signal.entry,
+                signal.side,
+                expiry_code,
+                cfg.option_moneyness,
+                cfg.strike_step,
+                cfg.option_prefix,
+            )
             trades_today = sum(1 for t in st.session_state.trade_log if str(datetime.now().date()) in str(t.get("timestamp", "")))
             ok, reason = risk_checks(signal, capital, st.session_state.daily_pnl, trades_today, cfg)
             qty = calculate_position_size(capital, cfg.risk_per_trade_pct, signal.entry, signal.stop_loss, cfg.lot_size)

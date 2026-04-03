@@ -890,18 +890,93 @@ def main() -> None:
             index=bt_period_options.index(default_bt_period),
             key="bt_period",
         )
+        bt_preset = st.selectbox("Backtest preset", ["Balanced", "Aggressive", "Strict"], index=0, key="bt_preset")
+
+        preset_defaults = {
+            "Balanced": {
+                "confidence_threshold": 0.55,
+                "volume_spike_threshold": 1.10,
+                "use_volume_filter": True,
+                "use_bb_filter": True,
+                "use_regime_filter": True,
+            },
+            "Aggressive": {
+                "confidence_threshold": 0.48,
+                "volume_spike_threshold": 1.00,
+                "use_volume_filter": False,
+                "use_bb_filter": False,
+                "use_regime_filter": True,
+            },
+            "Strict": {
+                "confidence_threshold": cfg.confidence_threshold,
+                "volume_spike_threshold": cfg.volume_spike_threshold,
+                "use_volume_filter": cfg.use_volume_filter,
+                "use_bb_filter": cfg.use_bb_filter,
+                "use_regime_filter": cfg.use_regime_filter,
+            },
+        }
+        preset = preset_defaults[bt_preset]
+
+        with st.expander("Backtest tuning", expanded=True):
+            bt_confidence = st.slider(
+                "Backtest confidence threshold",
+                0.40,
+                0.90,
+                float(preset["confidence_threshold"]),
+                0.01,
+                key=f"bt_confidence_{bt_preset}",
+            )
+            bt_volume_spike = st.slider(
+                "Backtest volume spike threshold",
+                1.00,
+                2.00,
+                float(preset["volume_spike_threshold"]),
+                0.05,
+                key=f"bt_volume_spike_{bt_preset}",
+            )
+            bt_use_volume = st.checkbox(
+                "Use volume filter",
+                value=bool(preset["use_volume_filter"]),
+                key=f"bt_use_volume_{bt_preset}",
+            )
+            bt_use_bb = st.checkbox(
+                "Use Bollinger filter",
+                value=bool(preset["use_bb_filter"]),
+                key=f"bt_use_bb_{bt_preset}",
+            )
+            bt_use_regime = st.checkbox(
+                "Use regime filter",
+                value=bool(preset["use_regime_filter"]),
+                key=f"bt_use_regime_{bt_preset}",
+            )
         run_bt = st.button("Run Backtest", use_container_width=True)
 
         if run_bt:
             bt_price = load_price_data(cfg.symbol, bt_interval, bt_period)
             bt_vix = load_vix_data(cfg.vix_symbol)
-            bt_cfg = StrategyConfig(**{**cfg.__dict__, "bar_interval": bt_interval, "history_period": bt_period})
+            bt_cfg = StrategyConfig(
+                **{
+                    **cfg.__dict__,
+                    "bar_interval": bt_interval,
+                    "history_period": bt_period,
+                    "confidence_threshold": bt_confidence,
+                    "volume_spike_threshold": bt_volume_spike,
+                    "use_volume_filter": bt_use_volume,
+                    "use_bb_filter": bt_use_bb,
+                    "use_regime_filter": bt_use_regime,
+                }
+            )
             if bt_price.empty:
                 st.warning(
                     f"No backtest price data was returned for interval `{bt_interval}` and period `{bt_period}`. "
                     "Yahoo Finance only provides intraday data for a limited recent window."
                 )
             else:
+                st.caption(
+                    f"Running {bt_preset.lower()} backtest with confidence >= {bt_confidence:.2f}, "
+                    f"volume spike >= {bt_volume_spike:.2f}, volume filter={bt_use_volume}, "
+                    f"BB filter={bt_use_bb}, regime filter={bt_use_regime}."
+                )
                 with st.spinner("Running backtest..."):
                     trades_df, stats = backtest_strategy(bt_price, bt_vix, bt_cfg, capital)
                 if not stats:

@@ -8,6 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Literal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -36,6 +37,7 @@ st.set_page_config(page_title="NIFTY Live Trading System", layout="wide")
 TradeMode = Literal["PAPER", "LIVE"]
 SignalSide = Literal["CE", "PE"]
 Regime = Literal["TRENDING", "RANGE", "VOLATILE"]
+IST = ZoneInfo("Asia/Kolkata")
 
 INSTRUMENTS = {
     "NIFTY 50": {
@@ -79,6 +81,38 @@ INSTRUMENTS = {
         "expiry_weekday": 3,
     },
 }
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def format_ist_timestamp(value: object, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> str:
+    if value is None or value == "":
+        return ""
+
+    ts: Optional[datetime] = None
+    if isinstance(value, pd.Timestamp):
+        ts = value.to_pydatetime()
+    elif isinstance(value, datetime):
+        ts = value
+    elif isinstance(value, str):
+        try:
+            ts = datetime.fromisoformat(value)
+        except ValueError:
+            parsed = pd.to_datetime(value, errors="coerce")
+            if pd.isna(parsed):
+                return str(value)
+            ts = parsed.to_pydatetime()
+
+    if ts is None:
+        return str(value)
+
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=IST)
+    else:
+        ts = ts.astimezone(IST)
+    return ts.strftime(fmt)
 
 
 @dataclass
@@ -171,7 +205,7 @@ class PaperBroker(BrokerInterface):
             "qty": qty,
             "symbol": option_symbol,
             "mode": mode,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(timespec="seconds"),
         }
 
     def exit_order(self, option_symbol: str, qty: int, mode: TradeMode) -> dict:
@@ -180,7 +214,7 @@ class PaperBroker(BrokerInterface):
             "qty": qty,
             "symbol": option_symbol,
             "mode": mode,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(timespec="seconds"),
         }
 
 
@@ -367,7 +401,7 @@ class DhanBroker(BrokerInterface):
             "symbol": option_symbol,
             "security_id": contract["security_id"],
             "exchange_segment": contract["exchange_segment"],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(timespec="seconds"),
             "raw": data,
         }
 
@@ -404,7 +438,7 @@ class DhanBroker(BrokerInterface):
             "symbol": option_symbol,
             "security_id": contract["security_id"],
             "exchange_segment": contract["exchange_segment"],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(timespec="seconds"),
             "raw": data,
         }
 
@@ -517,7 +551,7 @@ def make_option_symbol(
 
 
 def infer_nearest_weekly_expiry(now: Optional[datetime] = None, expiry_weekday: int = 3) -> str:
-    now = now or datetime.now()
+    now = now or now_ist()
     days_ahead = (expiry_weekday - now.weekday()) % 7
     expiry = now + timedelta(days=days_ahead)
     return expiry.strftime("%d%b%y").upper()
@@ -618,7 +652,7 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
             bearish_reasons.append("High VIX regime")
 
     spot = float(row["Close"])
-    ts = row.name.to_pydatetime() if hasattr(row.name, "to_pydatetime") else datetime.now()
+    ts = row.name.to_pydatetime() if hasattr(row.name, "to_pydatetime") else now_ist()
 
     if bullish_score >= cfg.confidence_threshold and bullish_score > bearish_score:
         stop = min(float(row["Low"]), float(row["vwap"]))
@@ -980,7 +1014,7 @@ def main() -> None:
                 cfg.strike_step,
                 cfg.option_prefix,
             )
-            trades_today = sum(1 for t in st.session_state.trade_log if str(datetime.now().date()) in str(t.get("timestamp", "")))
+            trades_today = sum(1 for t in st.session_state.trade_log if str(now_ist().date()) in str(t.get("timestamp", "")))
             ok, reason = risk_checks(signal, capital, st.session_state.daily_pnl, trades_today, cfg)
             qty = calculate_position_size(capital, cfg.risk_per_trade_pct, signal.entry, signal.stop_loss, cfg.lot_size)
 
@@ -1021,7 +1055,7 @@ def main() -> None:
                                 stop_loss=signal.stop_loss,
                                 target=signal.target,
                                 qty=qty,
-                                opened_at=datetime.now(),
+                                opened_at=now_ist(),
                                 mode=mode,
                                 reason=signal.reason,
                                 option_symbol=option_symbol,
@@ -1067,7 +1101,7 @@ def main() -> None:
                     "Mode": pos.mode,
                     "Option": pos.option_symbol,
                     "Security ID": pos.security_id,
-                    "Opened": pos.opened_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "Opened": format_ist_timestamp(pos.opened_at),
                     "Mark Source": price_label,
                     "Est. PnL": round(pnl, 2),
                     "Reason": pos.reason[:120],
@@ -1096,7 +1130,11 @@ def main() -> None:
                                     exit_mark = float(price_df["Close"].iloc[-1])
                             realized = (exit_mark - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - exit_mark) * pos.qty
                             st.session_state.daily_pnl += realized
-                            st.session_state.trade_log.append({**resp, "realized_pnl": realized})
+                            st.session_state.trade_log.append({
+                                **resp,
+                                "realized_pnl": realized,
+                                "exit_time": now_ist().isoformat(timespec="seconds"),
+                            })
                             st.success(f"Exited. Realized P&L: ₹{realized:,.2f}")
                         else:
                             st.session_state.trade_log.append(resp)
@@ -1106,7 +1144,11 @@ def main() -> None:
 
         st.markdown("### Trade Log")
         if st.session_state.trade_log:
-            st.dataframe(pd.DataFrame(st.session_state.trade_log), use_container_width=True)
+            trade_log_df = pd.DataFrame(st.session_state.trade_log).copy()
+            for col in ("timestamp", "entry_time", "exit_time", "opened_at"):
+                if col in trade_log_df.columns:
+                    trade_log_df[col] = trade_log_df[col].apply(format_ist_timestamp)
+            st.dataframe(trade_log_df, use_container_width=True)
         else:
             st.write("No trades yet.")
 

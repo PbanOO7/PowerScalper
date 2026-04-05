@@ -38,6 +38,8 @@ TradeMode = Literal["PAPER", "LIVE"]
 SignalSide = Literal["CE", "PE"]
 Regime = Literal["TRENDING", "RANGE", "VOLATILE"]
 IST = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN_TIME = "09:15"
+MARKET_CLOSE_TIME = "15:30"
 
 INSTRUMENTS = {
     "NIFTY 50": {
@@ -113,6 +115,24 @@ def format_ist_timestamp(value: object, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> s
     else:
         ts = ts.astimezone(IST)
     return ts.strftime(fmt)
+
+
+def normalize_intraday_data(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    x = df.copy()
+    idx = pd.to_datetime(x.index)
+    if getattr(idx, "tz", None) is None:
+        idx = idx.tz_localize(IST)
+    else:
+        idx = idx.tz_convert(IST)
+
+    x.index = idx
+    x = x.sort_index()
+    x = x[x.index.dayofweek < 5]
+    x = x.between_time(MARKET_OPEN_TIME, MARKET_CLOSE_TIME)
+    return x
 
 
 @dataclass
@@ -843,7 +863,10 @@ def load_price_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [c[0] for c in df.columns]
-    return df.dropna().copy()
+    df = df.dropna().copy()
+    if interval in {"5m", "15m", "30m", "60m", "90m", "1h"}:
+        df = normalize_intraday_data(df)
+    return df
 
 
 @st.cache_data(ttl=900)
@@ -1272,7 +1295,11 @@ def main() -> None:
                     k5.metric("Profit Factor", f"{pf:.2f}")
                     st.write(f"**Max Drawdown:** {stats['max_drawdown_pct'] * 100:.2f}%")
                     if not trades_df.empty:
-                        st.dataframe(trades_df.tail(100), use_container_width=True)
+                        display_trades_df = trades_df.tail(100).copy()
+                        for col in ("entry_time", "exit_time"):
+                            if col in display_trades_df.columns:
+                                display_trades_df[col] = display_trades_df[col].apply(format_ist_timestamp)
+                        st.dataframe(display_trades_df, use_container_width=True)
                         equity = trades_df[["exit_time", "capital_after"]].copy()
                         equity = equity.set_index("exit_time")
                         st.line_chart(equity)

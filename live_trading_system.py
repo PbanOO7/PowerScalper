@@ -151,6 +151,168 @@ def auth_credentials() -> tuple[Optional[str], Optional[str]]:
     return read_secret("auth", "username"), read_secret("auth", "password")
 
 
+def render_login_shell() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(202, 138, 4, 0.16), transparent 28%),
+                radial-gradient(circle at 85% 15%, rgba(15, 118, 110, 0.18), transparent 26%),
+                linear-gradient(135deg, #f7f1e3 0%, #efe7d4 45%, #e5dcc8 100%);
+        }
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+        [data-testid="stSidebar"] {
+            display: none;
+        }
+        .login-stage {
+            padding: 2.5rem 0 1rem 0;
+            animation: fade-slide 0.8s ease-out;
+        }
+        .login-brand {
+            padding: 2rem 2.2rem;
+            border-radius: 28px;
+            min-height: 540px;
+            color: #1f2937;
+            background:
+                linear-gradient(160deg, rgba(255,255,255,0.72), rgba(255,248,235,0.84)),
+                linear-gradient(135deg, #f4ede1, #f0e4cb);
+            border: 1px solid rgba(120, 113, 108, 0.18);
+            box-shadow: 0 28px 70px rgba(68, 64, 60, 0.12);
+            position: relative;
+            overflow: hidden;
+        }
+        .login-brand::after {
+            content: "";
+            position: absolute;
+            width: 240px;
+            height: 240px;
+            right: -40px;
+            bottom: -40px;
+            border-radius: 999px;
+            background: radial-gradient(circle, rgba(245, 158, 11, 0.20), rgba(245, 158, 11, 0));
+            animation: float-orb 6s ease-in-out infinite;
+        }
+        .login-kicker {
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            font-size: 0.78rem;
+            font-weight: 700;
+            color: #b45309;
+            margin-bottom: 1rem;
+        }
+        .login-title {
+            font-family: Georgia, "Times New Roman", serif;
+            font-size: 3.1rem;
+            line-height: 1.02;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 1rem;
+            max-width: 10ch;
+        }
+        .login-copy {
+            font-size: 1rem;
+            line-height: 1.75;
+            color: #4b5563;
+            max-width: 42ch;
+            margin-bottom: 1.6rem;
+        }
+        .login-pill-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem;
+            margin-top: 1.25rem;
+        }
+        .login-pill {
+            padding: 0.7rem 0.95rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(120, 113, 108, 0.14);
+            color: #374151;
+            font-size: 0.92rem;
+            box-shadow: 0 10px 22px rgba(148, 163, 184, 0.08);
+        }
+        .login-card {
+            padding: 2rem 1.8rem;
+            border-radius: 28px;
+            background: rgba(255, 255, 255, 0.92);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            box-shadow: 0 28px 70px rgba(51, 65, 85, 0.14);
+            backdrop-filter: blur(12px);
+            animation: fade-slide 0.9s ease-out;
+        }
+        .login-card h3 {
+            margin: 0 0 0.35rem 0;
+            font-size: 1.45rem;
+            color: #111827;
+        }
+        .login-card p {
+            margin: 0 0 1.25rem 0;
+            color: #6b7280;
+            line-height: 1.6;
+        }
+        .login-footer {
+            margin-top: 1rem;
+            color: #6b7280;
+            font-size: 0.88rem;
+        }
+        @keyframes fade-slide {
+            from {
+                opacity: 0;
+                transform: translateY(18px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        @keyframes float-orb {
+            0%, 100% {
+                transform: translateY(0px);
+            }
+            50% {
+                transform: translateY(-14px);
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="login-stage">', unsafe_allow_html=True)
+    left_col, right_col = st.columns([1.2, 0.9], gap="large")
+    with left_col:
+        st.markdown(
+            """
+            <div class="login-brand">
+                <div class="login-kicker">Professional Access</div>
+                <div class="login-title">PowerScalper Control Panel</div>
+                <div class="login-copy">
+                    Secure access to the strategy console, backtest engine, paper execution flow,
+                    and live broker controls. Use your authorized credentials to continue.
+                </div>
+                <div class="login-pill-row">
+                    <div class="login-pill">Signal Engine</div>
+                    <div class="login-pill">Risk Controls</div>
+                    <div class="login-pill">Paper and Live Modes</div>
+                    <div class="login-pill">Broker Connectivity</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with right_col:
+        st.markdown(
+            """
+            <div class="login-card">
+                <h3>Sign In</h3>
+                <p>Only authorized users should have access to this trading environment.</p>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def ensure_login() -> None:
     auth_user, auth_password = auth_credentials()
     if not auth_user or not auth_password:
@@ -161,20 +323,30 @@ def ensure_login() -> None:
     if st.session_state.get("authenticated"):
         return
 
-    st.title("PowerScalper Login")
-    st.caption("Authorized access only.")
+    render_login_shell()
     with st.form("login_form", clear_on_submit=False):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
+        username = st.text_input("Username", placeholder="Enter your user ID")
+        password = st.text_input("Password", type="password", placeholder="Enter your password")
         submitted = st.form_submit_button("Login", use_container_width=True)
 
-    if submitted:
-        valid = hmac.compare_digest(username.strip(), auth_user) and hmac.compare_digest(password, auth_password)
-        if valid:
-            st.session_state.authenticated = True
-            st.session_state.auth_username = auth_user
-            st.rerun()
-        st.error("Invalid username or password.")
+        if submitted:
+            valid = hmac.compare_digest(username.strip(), auth_user) and hmac.compare_digest(password, auth_password)
+            if valid:
+                st.session_state.authenticated = True
+                st.session_state.auth_username = auth_user
+                st.rerun()
+            st.error("Invalid username or password.")
+
+    st.markdown(
+        """
+            <div class="login-footer">
+                Protected deployment. Contact the administrator if you need access.
+            </div>
+        </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.stop()
 

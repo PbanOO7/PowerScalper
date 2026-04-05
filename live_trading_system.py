@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import math
 import os
 import time
@@ -134,6 +135,48 @@ def normalize_intraday_data(df: pd.DataFrame) -> pd.DataFrame:
     x = x[x.index.dayofweek < 5]
     x = x.between_time(MARKET_OPEN_TIME, MARKET_CLOSE_TIME)
     return x
+
+
+def read_secret(section: str, key: str) -> Optional[str]:
+    try:
+        if section in st.secrets and key in st.secrets[section]:
+            value = st.secrets[section][key]
+            return str(value).strip() if value else None
+    except Exception:
+        pass
+    return None
+
+
+def auth_credentials() -> tuple[Optional[str], Optional[str]]:
+    return read_secret("auth", "username"), read_secret("auth", "password")
+
+
+def ensure_login() -> None:
+    auth_user, auth_password = auth_credentials()
+    if not auth_user or not auth_password:
+        st.title("PowerScalper Login")
+        st.error("App login is not configured. Add [auth].username and [auth].password to Streamlit secrets.")
+        st.stop()
+
+    if st.session_state.get("authenticated"):
+        return
+
+    st.title("PowerScalper Login")
+    st.caption("Authorized access only.")
+    with st.form("login_form", clear_on_submit=False):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login", use_container_width=True)
+
+    if submitted:
+        valid = hmac.compare_digest(username.strip(), auth_user) and hmac.compare_digest(password, auth_password)
+        if valid:
+            st.session_state.authenticated = True
+            st.session_state.auth_username = auth_user
+            st.rerun()
+        st.error("Invalid username or password.")
+
+    st.stop()
 
 
 @dataclass
@@ -1105,6 +1148,8 @@ def supported_backtest_periods(interval: str) -> list[str]:
 # Session state
 # -----------------------------
 def init_state() -> None:
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
     if "positions" not in st.session_state:
         st.session_state.positions = []
     if "trade_log" not in st.session_state:
@@ -1126,12 +1171,18 @@ def init_state() -> None:
 # -----------------------------
 def main() -> None:
     init_state()
+    ensure_login()
 
     st.title("Index Live Trading System")
     st.caption("Live CE/PE signal engine + strike selection + backtest engine + Dhan execution scaffold.")
 
     with st.sidebar:
         st.header("Trading Controls")
+        st.caption(f"Logged in as `{st.session_state.get('auth_username', 'user')}`")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.auth_username = None
+            st.rerun()
         instrument_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), index=0)
         instrument = INSTRUMENTS[instrument_name]
         inferred_expiry = infer_nearest_weekly_expiry(expiry_weekday=instrument["expiry_weekday"])

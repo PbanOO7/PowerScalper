@@ -40,6 +40,7 @@ Regime = Literal["TRENDING", "RANGE", "VOLATILE"]
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN_TIME = "09:15"
 MARKET_CLOSE_TIME = "15:30"
+HELP_URL = "https://github.com/PbanOO7/PowerScalper#readme"
 
 INSTRUMENTS = {
     "NIFTY 50": {
@@ -1168,6 +1169,7 @@ def main() -> None:
             f"Lot size: {instrument['lot_size']} | Strike step: {instrument['strike_step']} | "
             f"Yahoo symbol: `{instrument['symbol']}`"
         )
+        st.markdown(f"[Help: How to use this app]({HELP_URL})")
         refresh = st.button("Refresh Signals", use_container_width=True)
         auto_refresh = st.checkbox("Auto-refresh every 60 sec", value=False)
 
@@ -1205,7 +1207,7 @@ def main() -> None:
     broker: BrokerInterface = PaperBroker() if mode == "PAPER" else DhanBroker()
     live_ready, live_reason = broker.status()
 
-    live_tab, backtest_tab, notes_tab = st.tabs(["Live Signals", "Backtest", "Live Wiring Notes"])
+    live_tab, backtest_tab, notes_tab, help_tab = st.tabs(["Live Signals", "Backtest", "Live Wiring Notes", "Help"])
 
     with live_tab:
         if mode == "LIVE":
@@ -1664,6 +1666,30 @@ def main() -> None:
             """.strip(),
             language="python",
         )
+
+    with help_tab:
+        st.markdown("### How to use PowerScalper")
+        st.markdown(
+            """
+1. Start in `PAPER` mode.
+2. Pick the instrument and confirm the expiry code.
+3. Set capital, stop loss, target, and risk controls.
+4. Wait for a valid `CE` or `PE` signal with risk check `OK`.
+5. Execute the order and monitor open positions.
+6. Let the system exit on `SL`, `TARGET`, `TIME`, or exit manually.
+7. Use the `Backtest` tab before changing live settings.
+            """.strip()
+        )
+        st.markdown("### What each tab does")
+        st.markdown(
+            """
+- `Live Signals`: current signal, execution, positions, and trade log
+- `Backtest`: historical simulation with slippage, costs, and equity curve
+- `Live Wiring Notes`: Dhan integration notes and secrets setup
+- `Help`: quick operating guide and documentation link
+            """.strip()
+        )
+        st.markdown(f"[Open full setup and usage guide]({HELP_URL})")
 
 
 if __name__ == "__main__":

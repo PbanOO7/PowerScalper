@@ -169,6 +169,9 @@ class StrategyConfig:
     use_regime_filter: bool = True
     use_volume_filter: bool = True
     use_bb_filter: bool = True
+    backtest_slippage_pct: float = 0.0015
+    backtest_cost_pct: float = 0.0010
+    backtest_fixed_cost_per_order: float = 20.0
 
 
 @dataclass
@@ -698,6 +701,20 @@ def derive_daily_vix_map(vix_df: pd.DataFrame) -> dict:
     return {d.date(): float(c) for d, c in zip(temp.index, temp["Close"])}
 
 
+def apply_backtest_slippage(price: float, side: SignalSide, is_entry: bool, slippage_pct: float) -> float:
+    slip = max(slippage_pct, 0.0)
+    if side == "CE":
+        return price * (1 + slip) if is_entry else price * (1 - slip)
+    return price * (1 - slip) if is_entry else price * (1 + slip)
+
+
+def estimate_backtest_costs(entry_price: float, exit_price: float, qty: int, cfg: StrategyConfig) -> float:
+    turnover = (abs(entry_price) + abs(exit_price)) * max(qty, 0)
+    variable_cost = turnover * max(cfg.backtest_cost_pct, 0.0)
+    fixed_cost = max(cfg.backtest_fixed_cost_per_order, 0.0) * 2
+    return variable_cost + fixed_cost
+
+
 def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: StrategyConfig, capital: float = 100000.0) -> tuple[pd.DataFrame, dict]:
     if price_df.empty:
         return pd.DataFrame(), {}
@@ -754,22 +771,31 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
                 hit_exit = True
 
             if hit_exit:
-                pnl_per_unit = (exit_price - open_trade["entry"]) if open_trade["side"] == "CE" else (open_trade["entry"] - exit_price)
+                side = open_trade["side"]
+                entry_exec = apply_backtest_slippage(open_trade["entry"], side, True, cfg.backtest_slippage_pct)
+                exit_exec = apply_backtest_slippage(float(exit_price), side, False, cfg.backtest_slippage_pct)
+                pnl_per_unit = (exit_exec - entry_exec) if side == "CE" else (entry_exec - exit_exec)
                 gross_pnl = pnl_per_unit * open_trade["qty"]
-                current_capital += gross_pnl
-                daily_pnl[day] += gross_pnl
+                total_cost = estimate_backtest_costs(entry_exec, exit_exec, open_trade["qty"], cfg)
+                net_pnl = gross_pnl - total_cost
+                current_capital += net_pnl
+                daily_pnl[day] += net_pnl
                 peak_capital = max(peak_capital, current_capital)
                 dd = (peak_capital - current_capital) / peak_capital if peak_capital > 0 else 0
                 max_drawdown = max(max_drawdown, dd)
                 trades.append({
                     "entry_time": open_trade["timestamp"],
                     "exit_time": now,
-                    "side": open_trade["side"],
+                    "side": side,
                     "regime": open_trade["regime"],
                     "entry": open_trade["entry"],
-                    "exit": exit_price,
+                    "exit": float(exit_price),
+                    "entry_exec": entry_exec,
+                    "exit_exec": exit_exec,
                     "qty": open_trade["qty"],
                     "gross_pnl": gross_pnl,
+                    "costs": total_cost,
+                    "net_pnl": net_pnl,
                     "reason": open_trade["reason"],
                     "exit_reason": reason,
                     "capital_after": current_capital,
@@ -811,20 +837,24 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
         return trades_df, {
             "total_trades": 0,
             "win_rate": 0.0,
+            "gross_pnl": 0.0,
+            "total_costs": 0.0,
             "net_pnl": 0.0,
             "return_pct": 0.0,
             "max_drawdown_pct": 0.0,
             "profit_factor": 0.0,
         }
 
-    wins = trades_df[trades_df["gross_pnl"] > 0]
-    losses = trades_df[trades_df["gross_pnl"] <= 0]
-    gross_profit = wins["gross_pnl"].sum()
-    gross_loss = abs(losses["gross_pnl"].sum())
+    wins = trades_df[trades_df["net_pnl"] > 0]
+    losses = trades_df[trades_df["net_pnl"] <= 0]
+    gross_profit = wins["net_pnl"].sum()
+    gross_loss = abs(losses["net_pnl"].sum())
     stats = {
         "total_trades": int(len(trades_df)),
-        "win_rate": float((trades_df["gross_pnl"] > 0).mean()),
-        "net_pnl": float(trades_df["gross_pnl"].sum()),
+        "win_rate": float((trades_df["net_pnl"] > 0).mean()),
+        "gross_pnl": float(trades_df["gross_pnl"].sum()),
+        "total_costs": float(trades_df["costs"].sum()),
+        "net_pnl": float(trades_df["net_pnl"].sum()),
         "return_pct": float((current_capital - capital) / capital),
         "max_drawdown_pct": float(max_drawdown),
         "profit_factor": float(gross_profit / gross_loss) if gross_loss > 0 else float("inf"),
@@ -1253,6 +1283,32 @@ def main() -> None:
                 value=bool(preset["use_regime_filter"]),
                 key=f"bt_use_regime_{bt_preset}",
             )
+            bt_slippage_bps = st.slider(
+                "Slippage per side (bps)",
+                0.0,
+                100.0,
+                float(cfg.backtest_slippage_pct * 10000),
+                1.0,
+                key=f"bt_slippage_bps_{bt_preset}",
+                help="Applied on both entry and exit. 10 bps = 0.10%.",
+            )
+            bt_cost_bps = st.slider(
+                "Variable costs round-trip (bps)",
+                0.0,
+                100.0,
+                float(cfg.backtest_cost_pct * 10000),
+                1.0,
+                key=f"bt_cost_bps_{bt_preset}",
+                help="Approximate brokerage, taxes, and fees as a percentage of turnover.",
+            )
+            bt_fixed_cost = st.number_input(
+                "Fixed cost per order (₹)",
+                min_value=0.0,
+                value=float(cfg.backtest_fixed_cost_per_order),
+                step=5.0,
+                key=f"bt_fixed_cost_{bt_preset}",
+                help="Applied once on entry and once on exit.",
+            )
         run_bt = st.button("Run Backtest", use_container_width=True)
 
         if run_bt:
@@ -1268,6 +1324,9 @@ def main() -> None:
                     "use_volume_filter": bt_use_volume,
                     "use_bb_filter": bt_use_bb,
                     "use_regime_filter": bt_use_regime,
+                    "backtest_slippage_pct": bt_slippage_bps / 10000,
+                    "backtest_cost_pct": bt_cost_bps / 10000,
+                    "backtest_fixed_cost_per_order": bt_fixed_cost,
                 }
             )
             if bt_price.empty:
@@ -1279,7 +1338,9 @@ def main() -> None:
                 st.caption(
                     f"Running {bt_preset.lower()} backtest with confidence >= {bt_confidence:.2f}, "
                     f"volume spike >= {bt_volume_spike:.2f}, volume filter={bt_use_volume}, "
-                    f"BB filter={bt_use_bb}, regime filter={bt_use_regime}."
+                    f"BB filter={bt_use_bb}, regime filter={bt_use_regime}, "
+                    f"slippage={bt_slippage_bps:.0f} bps/side, variable costs={bt_cost_bps:.0f} bps, "
+                    f"fixed cost=₹{bt_fixed_cost:.0f}/order."
                 )
                 with st.spinner("Running backtest..."):
                     trades_df, stats = backtest_strategy(bt_price, bt_vix, bt_cfg, capital)
@@ -1293,6 +1354,8 @@ def main() -> None:
                     k4.metric("Return", f"{stats['return_pct'] * 100:.2f}%")
                     pf = stats['profit_factor'] if math.isfinite(stats['profit_factor']) else 999.0
                     k5.metric("Profit Factor", f"{pf:.2f}")
+                    st.write(f"**Gross P&L:** ₹{stats['gross_pnl']:,.2f}")
+                    st.write(f"**Estimated Costs:** ₹{stats['total_costs']:,.2f}")
                     st.write(f"**Max Drawdown:** {stats['max_drawdown_pct'] * 100:.2f}%")
                     if not trades_df.empty:
                         display_trades_df = trades_df.tail(100).copy()

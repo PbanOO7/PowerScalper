@@ -158,10 +158,16 @@ class StrategyConfig:
     high_vix_threshold: float = 18.0
     min_rr: float = 1.5
     max_rr: float = 2.0
-    max_daily_loss_pct: float = 2.5
+    stop_loss_pct: float = 0.6
+    target_pct: float = 1.2
+    max_holding_minutes: int = 30
+    max_daily_loss_pct: float = 5.0
     risk_per_trade_pct: float = 1.0
+    max_capital_allocation_pct: float = 25.0
+    max_consecutive_losses: int = 3
     max_trades_per_day: int = 3
     confidence_threshold: float = 0.72
+    min_vix_trade_threshold: float = 13.0
     allow_live_orders: bool = False
     lot_size: int = 75
     strike_step: int = 50
@@ -172,6 +178,7 @@ class StrategyConfig:
     backtest_slippage_pct: float = 0.0015
     backtest_cost_pct: float = 0.0010
     backtest_fixed_cost_per_order: float = 20.0
+    option_price_factor_pct: float = 0.8
 
 
 @dataclass
@@ -184,6 +191,9 @@ class Signal:
     regime: Regime
     confidence: float
     reason: str
+    option_entry: float
+    option_stop_loss: float
+    option_target: float
 
 
 @dataclass
@@ -201,6 +211,9 @@ class Position:
     exchange_segment: Optional[str] = None
     order_id: Optional[str] = None
     trailing_active: bool = False
+    entry_spot: Optional[float] = None
+    stop_loss_spot: Optional[float] = None
+    target_spot: Optional[float] = None
 
 
 # -----------------------------
@@ -586,6 +599,8 @@ def infer_nearest_weekly_expiry(now: Optional[datetime] = None, expiry_weekday: 
 def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cfg: StrategyConfig) -> Optional[Signal]:
     if df.empty or len(df) < max(cfg.slow_ema + 5, cfg.bb_period + 5):
         return None
+    if vix_now < cfg.min_vix_trade_threshold:
+        return None
 
     x = enrich_price_data(df, cfg)
     row = x.iloc[-1]
@@ -676,16 +691,42 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
 
     spot = float(row["Close"])
     ts = row.name.to_pydatetime() if hasattr(row.name, "to_pydatetime") else now_ist()
+    option_entry = estimated_option_price(spot, spot, "CE", cfg)
+    option_stop, option_target = premium_stop_target(option_entry, cfg)
 
     if bullish_score >= cfg.confidence_threshold and bullish_score > bearish_score:
-        stop = min(float(row["Low"]), float(row["vwap"]))
-        risk = max(spot - stop, 0.5)
-        return Signal(ts, "CE", spot, stop, spot + risk * cfg.min_rr, regime, round(min(bullish_score, 0.99), 3), " | ".join(bullish_reasons))
+        bullish_reasons.append(f"Premium SL {cfg.stop_loss_pct:.1f}% / target {cfg.target_pct:.1f}%")
+        return Signal(
+            ts,
+            "CE",
+            spot,
+            float(row["Low"]),
+            float(row["High"]),
+            regime,
+            round(min(bullish_score, 0.99), 3),
+            " | ".join(bullish_reasons),
+            option_entry,
+            option_stop,
+            option_target,
+        )
 
     if bearish_score >= cfg.confidence_threshold and bearish_score > bullish_score:
-        stop = max(float(row["High"]), float(row["vwap"]))
-        risk = max(stop - spot, 0.5)
-        return Signal(ts, "PE", spot, stop, spot - risk * cfg.min_rr, regime, round(min(bearish_score, 0.99), 3), " | ".join(bearish_reasons))
+        option_entry = estimated_option_price(spot, spot, "PE", cfg)
+        option_stop, option_target = premium_stop_target(option_entry, cfg)
+        bearish_reasons.append(f"Premium SL {cfg.stop_loss_pct:.1f}% / target {cfg.target_pct:.1f}%")
+        return Signal(
+            ts,
+            "PE",
+            spot,
+            float(row["High"]),
+            float(row["Low"]),
+            regime,
+            round(min(bearish_score, 0.99), 3),
+            " | ".join(bearish_reasons),
+            option_entry,
+            option_stop,
+            option_target,
+        )
 
     return None
 
@@ -715,6 +756,93 @@ def estimate_backtest_costs(entry_price: float, exit_price: float, qty: int, cfg
     return variable_cost + fixed_cost
 
 
+def estimated_option_price(spot_now: float, spot_entry: float, side: SignalSide, cfg: StrategyConfig) -> float:
+    base_premium = max(spot_entry * (cfg.option_price_factor_pct / 100), 20.0)
+    intrinsic = max(spot_now - spot_entry, 0.0) if side == "CE" else max(spot_entry - spot_now, 0.0)
+    directional_move = (spot_now - spot_entry) if side == "CE" else (spot_entry - spot_now)
+    premium = base_premium + (directional_move * 0.5) + (intrinsic * 0.15)
+    return max(premium, 1.0)
+
+
+def option_price_bounds(high_spot: float, low_spot: float, spot_entry: float, side: SignalSide, cfg: StrategyConfig) -> tuple[float, float]:
+    price_at_high = estimated_option_price(high_spot, spot_entry, side, cfg)
+    price_at_low = estimated_option_price(low_spot, spot_entry, side, cfg)
+    return min(price_at_high, price_at_low), max(price_at_high, price_at_low)
+
+
+def premium_stop_target(entry_premium: float, cfg: StrategyConfig) -> tuple[float, float]:
+    stop_loss = entry_premium * (1 - cfg.stop_loss_pct / 100)
+    target = entry_premium * (1 + cfg.target_pct / 100)
+    return max(stop_loss, 1.0), max(target, 1.0)
+
+
+def calculate_position_size(
+    capital: float,
+    risk_pct: float,
+    entry_premium: float,
+    stop_loss_premium: float,
+    lot_size: int = 75,
+    max_allocation_pct: float = 25.0,
+    premium_per_unit: Optional[float] = None,
+) -> int:
+    bounded_risk_pct = min(max(risk_pct, 1.0), 2.0)
+    max_risk_rupees = capital * (bounded_risk_pct / 100)
+    per_unit_risk = max(abs(entry_premium - stop_loss_premium), 0.5)
+    risk_limited_qty = math.floor(max_risk_rupees / per_unit_risk)
+
+    if premium_per_unit is None:
+        premium_per_unit = max(entry_premium, 1.0)
+    alloc_budget = capital * max(max_allocation_pct, 0.0) / 100
+    alloc_limited_qty = math.floor(alloc_budget / max(premium_per_unit, 1.0))
+
+    raw_qty = min(risk_limited_qty, alloc_limited_qty)
+    if raw_qty < lot_size:
+        return 0
+    lots = raw_qty // lot_size
+    return lots * lot_size
+
+
+def reset_daily_state_if_needed(capital: float) -> None:
+    current_day = str(now_ist().date())
+    if st.session_state.trade_day != current_day:
+        st.session_state.trade_day = current_day
+        st.session_state.daily_pnl = 0.0
+        st.session_state.loss_streak = 0
+        st.session_state.day_start_capital = capital
+
+
+def loss_limit_breached(day_start_capital: float, daily_realized_pnl: float, cfg: StrategyConfig) -> bool:
+    return daily_realized_pnl <= -(day_start_capital * cfg.max_daily_loss_pct / 100)
+
+
+def close_position_and_record(
+    pos: Position,
+    exit_mark: float,
+    exit_reason: str,
+    broker_response: dict,
+    *,
+    costs: float = 0.0,
+) -> float:
+    realized = (exit_mark - pos.entry) * pos.qty
+    realized -= costs
+    st.session_state.daily_pnl += realized
+    st.session_state.loss_streak = st.session_state.loss_streak + 1 if realized < 0 else 0
+    st.session_state.trade_log.append({
+        **broker_response,
+        "side": pos.side,
+        "qty": pos.qty,
+        "symbol": pos.option_symbol,
+        "entry_price": pos.entry,
+        "exit_price": exit_mark,
+        "exit_reason": exit_reason,
+        "realized_pnl": realized,
+        "costs": costs,
+        "entry_spot": pos.entry_spot,
+        "exit_time": now_ist().isoformat(timespec="seconds"),
+    })
+    return realized
+
+
 def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: StrategyConfig, capital: float = 100000.0) -> tuple[pd.DataFrame, dict]:
     if price_df.empty:
         return pd.DataFrame(), {}
@@ -728,12 +856,16 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
     max_drawdown = 0.0
     daily_trade_counts = {}
     daily_pnl = {}
+    daily_loss_streak = {}
+    day_start_capital = {}
 
     for i in range(max(cfg.slow_ema + 5, cfg.bb_period + 5), len(x)):
         now = x.index[i]
         day = pd.Timestamp(now).date()
         daily_trade_counts.setdefault(day, 0)
         daily_pnl.setdefault(day, 0.0)
+        daily_loss_streak.setdefault(day, 0)
+        day_start_capital.setdefault(day, current_capital)
 
         vix_now = vix_map.get(day, cfg.low_vix_threshold + 1)
         vix_prev = vix_map.get(day - timedelta(days=1), None)
@@ -746,40 +878,49 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
             reason = None
 
             if open_trade["side"] == "CE":
-                if row["Low"] <= open_trade["stop_loss"]:
+                option_low, option_high = option_price_bounds(float(row["High"]), float(row["Low"]), open_trade["entry_spot"], "CE", cfg)
+                if option_low <= open_trade["stop_loss"]:
                     exit_price = open_trade["stop_loss"]
                     reason = "SL"
                     hit_exit = True
-                elif row["High"] >= open_trade["target"]:
+                elif option_high >= open_trade["target"]:
                     exit_price = open_trade["target"]
                     reason = "TARGET"
                     hit_exit = True
             else:
-                if row["High"] >= open_trade["stop_loss"]:
+                option_low, option_high = option_price_bounds(float(row["High"]), float(row["Low"]), open_trade["entry_spot"], "PE", cfg)
+                if option_low <= open_trade["stop_loss"]:
                     exit_price = open_trade["stop_loss"]
                     reason = "SL"
                     hit_exit = True
-                elif row["Low"] <= open_trade["target"]:
+                elif option_high >= open_trade["target"]:
                     exit_price = open_trade["target"]
                     reason = "TARGET"
                     hit_exit = True
 
             end_of_day = i + 1 < len(x) and pd.Timestamp(x.index[i + 1]).date() != day
+            held_minutes = (now - open_trade["timestamp"]).total_seconds() / 60
+            timed_out = held_minutes >= cfg.max_holding_minutes
             if not hit_exit and end_of_day:
-                exit_price = float(row["Close"])
+                exit_price = estimated_option_price(float(row["Close"]), open_trade["entry_spot"], open_trade["side"], cfg)
                 reason = "EOD"
+                hit_exit = True
+            elif not hit_exit and timed_out:
+                exit_price = estimated_option_price(float(row["Close"]), open_trade["entry_spot"], open_trade["side"], cfg)
+                reason = "TIME"
                 hit_exit = True
 
             if hit_exit:
                 side = open_trade["side"]
                 entry_exec = apply_backtest_slippage(open_trade["entry"], side, True, cfg.backtest_slippage_pct)
                 exit_exec = apply_backtest_slippage(float(exit_price), side, False, cfg.backtest_slippage_pct)
-                pnl_per_unit = (exit_exec - entry_exec) if side == "CE" else (entry_exec - exit_exec)
+                pnl_per_unit = exit_exec - entry_exec
                 gross_pnl = pnl_per_unit * open_trade["qty"]
                 total_cost = estimate_backtest_costs(entry_exec, exit_exec, open_trade["qty"], cfg)
                 net_pnl = gross_pnl - total_cost
                 current_capital += net_pnl
                 daily_pnl[day] += net_pnl
+                daily_loss_streak[day] = daily_loss_streak[day] + 1 if net_pnl < 0 else 0
                 peak_capital = max(peak_capital, current_capital)
                 dd = (peak_capital - current_capital) / peak_capital if peak_capital > 0 else 0
                 max_drawdown = max(max_drawdown, dd)
@@ -796,6 +937,8 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
                     "gross_pnl": gross_pnl,
                     "costs": total_cost,
                     "net_pnl": net_pnl,
+                    "entry_spot": open_trade["entry_spot"],
+                    "exit_spot": float(row["Close"]),
                     "reason": open_trade["reason"],
                     "exit_reason": reason,
                     "capital_after": current_capital,
@@ -806,7 +949,9 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
         if open_trade is None:
             if daily_trade_counts[day] >= cfg.max_trades_per_day:
                 continue
-            if daily_pnl[day] <= -(current_capital * cfg.max_daily_loss_pct / 100):
+            if loss_limit_breached(day_start_capital[day], daily_pnl[day], cfg):
+                continue
+            if daily_loss_streak[day] >= cfg.max_consecutive_losses:
                 continue
 
             sub_df = x.iloc[: i + 1][["Open", "High", "Low", "Close", "Volume"]].copy()
@@ -814,21 +959,28 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
             if sig is None:
                 continue
 
-            risk_amt = current_capital * cfg.risk_per_trade_pct / 100
-            per_unit_risk = max(abs(sig.entry - sig.stop_loss), 0.5)
-            raw_qty = math.floor(risk_amt / per_unit_risk)
-            lots = max(raw_qty // cfg.lot_size, 1)
-            qty = lots * cfg.lot_size
+            qty = calculate_position_size(
+                current_capital,
+                cfg.risk_per_trade_pct,
+                sig.option_entry,
+                sig.option_stop_loss,
+                cfg.lot_size,
+                cfg.max_capital_allocation_pct,
+                sig.option_entry,
+            )
+            if qty <= 0:
+                continue
 
             open_trade = {
                 "timestamp": now,
                 "side": sig.side,
-                "entry": sig.entry,
-                "stop_loss": sig.stop_loss,
-                "target": sig.target,
+                "entry": sig.option_entry,
+                "stop_loss": sig.option_stop_loss,
+                "target": sig.option_target,
                 "qty": qty,
                 "regime": sig.regime,
                 "reason": sig.reason,
+                "entry_spot": sig.entry,
             }
             daily_trade_counts[day] += 1
 
@@ -865,20 +1017,25 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
 # -----------------------------
 # Risk management
 # -----------------------------
-def calculate_position_size(capital: float, risk_pct: float, entry: float, stop_loss: float, lot_size: int = 75) -> int:
-    max_risk_rupees = capital * (risk_pct / 100)
-    per_unit_risk = max(abs(entry - stop_loss), 0.5)
-    raw_qty = math.floor(max_risk_rupees / per_unit_risk)
-    lots = max(raw_qty // lot_size, 1)
-    return lots * lot_size
-
-
-def risk_checks(signal: Signal, capital: float, daily_realized_pnl: float, trades_today: int, cfg: StrategyConfig) -> tuple[bool, str]:
+def risk_checks(
+    signal: Signal,
+    day_start_capital: float,
+    daily_realized_pnl: float,
+    trades_today: int,
+    loss_streak: int,
+    cfg: StrategyConfig,
+) -> tuple[bool, str]:
+    if not 1.0 <= cfg.risk_per_trade_pct <= 2.0:
+        return False, "Risk per trade must stay between 1% and 2%"
     if trades_today >= cfg.max_trades_per_day:
         return False, "Max trades reached"
-    if daily_realized_pnl <= -(capital * cfg.max_daily_loss_pct / 100):
+    if loss_limit_breached(day_start_capital, daily_realized_pnl, cfg):
         return False, "Daily loss limit breached"
-    if abs(signal.entry - signal.stop_loss) < 0.5:
+    if loss_streak >= cfg.max_consecutive_losses:
+        return False, "Consecutive loss kill switch active"
+    if signal.confidence < cfg.confidence_threshold:
+        return False, "Signal confidence below threshold"
+    if abs(signal.option_entry - signal.option_stop_loss) < 0.5:
         return False, "Stop distance too tight"
     return True, "OK"
 
@@ -955,6 +1112,12 @@ def init_state() -> None:
         st.session_state.daily_pnl = 0.0
     if "last_signal_key" not in st.session_state:
         st.session_state.last_signal_key = None
+    if "loss_streak" not in st.session_state:
+        st.session_state.loss_streak = 0
+    if "trade_day" not in st.session_state:
+        st.session_state.trade_day = str(now_ist().date())
+    if "day_start_capital" not in st.session_state:
+        st.session_state.day_start_capital = 100000.0
 
 
 # -----------------------------
@@ -975,13 +1138,22 @@ def main() -> None:
             st.session_state.expiry_code_input = inferred_expiry
             st.session_state.expiry_instrument = instrument_name
         mode: TradeMode = st.radio("Trading Mode", ["PAPER", "LIVE"], index=0, horizontal=True)
+        live_confirmed = False
         if mode == "LIVE":
-            st.warning("⚠️ LIVE MODE ENABLED: Real trades will be executed. Start with small capital.")
+            st.warning("LIVE mode can place real broker orders.")
+            live_confirmed = st.checkbox("I confirm live trading is intentional", value=False)
         capital = st.number_input("Capital (₹)", min_value=10000.0, value=100000.0, step=10000.0)
-        risk_pct = st.slider("Risk per trade (%)", 0.25, 3.0, 1.0, 0.25)
+        sl_pct = st.slider("SL (%)", 20.0, 30.0, 25.0, 1.0)
+        target_pct = st.slider("Target (%)", 40.0, 60.0, 50.0, 1.0)
+        risk_pct = st.slider("Risk per trade (%)", 1.0, 2.0, 1.0, 0.25)
+        max_hold_mins = st.slider("Max holding time (min)", 5, 180, 30, 5)
+        daily_loss_limit = st.slider("Daily loss limit (%)", 1.0, 10.0, 5.0, 0.5)
+        max_loss_streak = st.slider("Consecutive losses limit", 1, 5, 3, 1)
+        max_alloc_pct = st.slider("Capital allocation cap (%)", 5.0, 100.0, 25.0, 5.0)
         max_trades = st.slider("Max trades per day", 1, 10, 3)
         confidence = st.slider("Minimum confidence", 0.50, 0.95, 0.72, 0.01)
-        low_vix = st.slider("Low VIX threshold", 10.0, 18.0, 14.0, 0.5)
+        min_vix_trade = st.slider("VIX threshold", 10.0, 20.0, 13.0, 0.5)
+        low_vix = st.slider("Low VIX regime threshold", 10.0, 18.0, 14.0, 0.5)
         high_vix = st.slider("High VIX threshold", 14.0, 25.0, 18.0, 0.5)
         interval = st.selectbox("Live bar interval", ["5m", "15m", "30m"], index=0)
         period = st.selectbox("Live history period", ["5d", "10d", "1mo"], index=1)
@@ -1010,14 +1182,25 @@ def main() -> None:
         strike_step=instrument["strike_step"],
         bar_interval=interval,
         history_period=period,
+        stop_loss_pct=sl_pct,
+        target_pct=target_pct,
+        max_holding_minutes=max_hold_mins,
+        max_daily_loss_pct=daily_loss_limit,
         risk_per_trade_pct=risk_pct,
+        max_capital_allocation_pct=max_alloc_pct,
+        max_consecutive_losses=max_loss_streak,
         max_trades_per_day=max_trades,
         confidence_threshold=confidence,
+        min_vix_trade_threshold=min_vix_trade,
         low_vix_threshold=low_vix,
         high_vix_threshold=high_vix,
-        allow_live_orders=(mode == "LIVE"),
+        allow_live_orders=(mode == "LIVE" and live_confirmed),
         option_moneyness=strike_mode,
     )
+
+    reset_daily_state_if_needed(capital)
+    if st.session_state.day_start_capital <= 0:
+        st.session_state.day_start_capital = capital
 
     broker: BrokerInterface = PaperBroker() if mode == "PAPER" else DhanBroker()
     live_ready, live_reason = broker.status()
@@ -1054,10 +1237,24 @@ def main() -> None:
         c2.metric("India VIX", f"{vix_now:.2f}")
         c3.metric("Regime", current_regime)
         c4.metric("Daily P&L", f"₹{st.session_state.daily_pnl:,.2f}")
+        kill_switch_active = (
+            loss_limit_breached(st.session_state.day_start_capital, st.session_state.daily_pnl, cfg)
+            or st.session_state.loss_streak >= cfg.max_consecutive_losses
+        )
+        st.caption(
+            f"Loss streak: {st.session_state.loss_streak}/{cfg.max_consecutive_losses} | "
+            f"Daily limit: {cfg.max_daily_loss_pct:.1f}% | "
+            f"Max hold: {cfg.max_holding_minutes} min"
+        )
+        if kill_switch_active:
+            st.error("Daily kill switch is active. New entries are blocked for the session.")
 
         st.markdown("### Live Signal")
         if signal is None:
-            st.info("No valid CE/PE setup right now. Stay flat.")
+            if vix_now < cfg.min_vix_trade_threshold:
+                st.info(f"No trade: India VIX {vix_now:.2f} is below the trade threshold of {cfg.min_vix_trade_threshold:.2f}.")
+            else:
+                st.info("No valid CE/PE setup right now. Stay flat.")
         else:
             option_symbol = make_option_symbol(
                 signal.entry,
@@ -1068,30 +1265,55 @@ def main() -> None:
                 cfg.option_prefix,
             )
             trades_today = sum(1 for t in st.session_state.trade_log if str(now_ist().date()) in str(t.get("timestamp", "")))
-            ok, reason = risk_checks(signal, capital, st.session_state.daily_pnl, trades_today, cfg)
-            qty = calculate_position_size(capital, cfg.risk_per_trade_pct, signal.entry, signal.stop_loss, cfg.lot_size)
+            estimated_premium = signal.option_entry
+            ok, reason = risk_checks(
+                signal,
+                st.session_state.day_start_capital,
+                st.session_state.daily_pnl,
+                trades_today,
+                st.session_state.loss_streak,
+                cfg,
+            )
+            qty = calculate_position_size(
+                capital,
+                cfg.risk_per_trade_pct,
+                signal.option_entry,
+                signal.option_stop_loss,
+                cfg.lot_size,
+                cfg.max_capital_allocation_pct,
+                estimated_premium,
+            )
+            if qty <= 0:
+                ok = False
+                reason = "Capital allocation cap too small for one lot"
 
             with st.container(border=True):
                 st.subheader(f"{signal.side} Signal")
                 st.write(f"**Confidence:** {signal.confidence:.2f}")
                 st.write(f"**Regime:** {signal.regime}")
-                st.write(f"**Entry:** {signal.entry:.2f}")
-                st.write(f"**Stop Loss:** {signal.stop_loss:.2f}")
-                st.write(f"**Target:** {signal.target:.2f}")
+                st.write(f"**Spot Entry:** {signal.entry:.2f}")
+                st.write(f"**Option Entry:** ₹{signal.option_entry:.2f}")
+                st.write(f"**Option Stop Loss:** ₹{signal.option_stop_loss:.2f}")
+                st.write(f"**Option Target:** ₹{signal.option_target:.2f}")
                 st.write(f"**Suggested Qty:** {qty}")
                 st.write(f"**Option Symbol:** `{option_symbol}`")
                 st.write(f"**Reason:** {signal.reason}")
                 st.write(f"**Risk Check:** {reason}")
 
                 signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
-                can_fire = ok and signal_key != st.session_state.last_signal_key and (mode == "PAPER" or live_ready)
+                can_fire = (
+                    ok
+                    and not kill_switch_active
+                    and signal_key != st.session_state.last_signal_key
+                    and (mode == "PAPER" or (live_ready and live_confirmed))
+                )
                 if st.button(f"Execute {mode} Order", disabled=not can_fire):
                     try:
                         resp = broker.place_order(signal.side, qty, option_symbol, mode)
                         st.session_state.trade_log.append(resp)
                         if resp.get("status") in {"paper_filled", "filled", "success", "accepted"}:
                             st.session_state.last_signal_key = signal_key
-                            entry_price = signal.entry
+                            entry_price = estimated_premium
                             if (
                                 mode == "LIVE"
                                 and isinstance(broker, DhanBroker)
@@ -1101,12 +1323,12 @@ def main() -> None:
                                 try:
                                     entry_price = broker.get_ltp(resp["security_id"], resp["exchange_segment"])
                                 except Exception:
-                                    entry_price = signal.entry
+                                    entry_price = estimated_premium
                             st.session_state.positions.append(Position(
                                 side=signal.side,
                                 entry=entry_price,
-                                stop_loss=signal.stop_loss,
-                                target=signal.target,
+                                stop_loss=signal.option_stop_loss,
+                                target=signal.option_target,
                                 qty=qty,
                                 opened_at=now_ist(),
                                 mode=mode,
@@ -1115,6 +1337,9 @@ def main() -> None:
                                 security_id=resp.get("security_id"),
                                 exchange_segment=resp.get("exchange_segment"),
                                 order_id=resp.get("order_id"),
+                                entry_spot=signal.entry,
+                                stop_loss_spot=signal.stop_loss,
+                                target_spot=signal.target,
                             ))
                             st.success(f"Order sent: {resp}")
                         else:
@@ -1127,10 +1352,12 @@ def main() -> None:
             st.write("No open positions.")
         else:
             current_spot = float(price_df["Close"].iloc[-1])
+            auto_close_indexes = []
             rows = []
             for idx, pos in enumerate(st.session_state.positions):
-                mark_price = current_spot
-                price_label = "Spot"
+                ref_spot = pos.entry_spot or current_spot
+                mark_price = estimated_option_price(current_spot, ref_spot, pos.side, cfg)
+                price_label = "Option Proxy"
                 if (
                     pos.mode == "LIVE"
                     and isinstance(broker, DhanBroker)
@@ -1142,24 +1369,64 @@ def main() -> None:
                         mark_price = broker.get_ltp(pos.security_id, pos.exchange_segment)
                         price_label = "Option LTP"
                     except Exception:
-                        mark_price = current_spot
-                pnl = (mark_price - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - mark_price) * pos.qty
+                        mark_price = estimated_option_price(current_spot, ref_spot, pos.side, cfg)
+                pnl = (mark_price - pos.entry) * pos.qty
+                held_minutes = (now_ist() - pos.opened_at).total_seconds() / 60
+                timed_out = held_minutes >= cfg.max_holding_minutes
+                stop_hit = mark_price <= pos.stop_loss
+                target_hit = mark_price >= pos.target
+                if timed_out:
+                    auto_close_indexes.append(idx)
+                elif stop_hit or target_hit:
+                    auto_close_indexes.append(idx)
                 rows.append({
                     "#": idx,
                     "Side": pos.side,
                     "Entry": pos.entry,
-                    "SL": pos.stop_loss,
-                    "Target": pos.target,
+                    "SL": round(pos.stop_loss, 2),
+                    "Target": round(pos.target, 2),
                     "Qty": pos.qty,
                     "Mode": pos.mode,
                     "Option": pos.option_symbol,
                     "Security ID": pos.security_id,
                     "Opened": format_ist_timestamp(pos.opened_at),
+                    "Held (min)": round(held_minutes, 1),
                     "Mark Source": price_label,
                     "Est. PnL": round(pnl, 2),
+                    "Exit Watch": "TIME" if timed_out else ("SL/TARGET" if stop_hit or target_hit else ""),
                     "Reason": pos.reason[:120],
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            for exit_index in sorted(auto_close_indexes, reverse=True):
+                pos = st.session_state.positions[exit_index]
+                try:
+                    resp = broker.exit_order(pos.option_symbol, pos.qty, pos.mode)
+                    if resp.get("status") in {"paper_exit", "exited", "success", "accepted"}:
+                        st.session_state.positions.pop(exit_index)
+                        exit_mark = estimated_option_price(current_spot, pos.entry_spot or current_spot, pos.side, cfg)
+                        exit_reason = "TIME"
+                        if exit_mark <= pos.stop_loss:
+                            exit_mark = pos.stop_loss
+                            exit_reason = "SL"
+                        elif exit_mark >= pos.target:
+                            exit_mark = pos.target
+                            exit_reason = "TARGET"
+                        if (
+                            pos.mode == "LIVE"
+                            and isinstance(broker, DhanBroker)
+                            and live_ready
+                            and pos.security_id
+                            and pos.exchange_segment
+                            ):
+                            try:
+                                exit_mark = broker.get_ltp(pos.security_id, pos.exchange_segment)
+                            except Exception:
+                                pass
+                        realized = close_position_and_record(pos, exit_mark, exit_reason, resp)
+                        st.warning(f"{exit_reason} exit executed for {pos.option_symbol}. Realized P&L: ₹{realized:,.2f}")
+                except Exception as exc:
+                    st.error(f"Auto-exit failed for {pos.option_symbol}: {exc}")
 
             exit_index = st.number_input("Exit position #", min_value=0, max_value=max(len(st.session_state.positions) - 1, 0), value=0, step=1)
             if st.button("Exit Selected Position"):
@@ -1169,7 +1436,7 @@ def main() -> None:
                         resp = broker.exit_order(pos.option_symbol, pos.qty, pos.mode)
                         if resp.get("status") in {"paper_exit", "exited", "success", "accepted"}:
                             st.session_state.positions.pop(exit_index)
-                            exit_mark = float(price_df["Close"].iloc[-1])
+                            exit_mark = estimated_option_price(current_spot, pos.entry_spot or current_spot, pos.side, cfg)
                             if (
                                 pos.mode == "LIVE"
                                 and isinstance(broker, DhanBroker)
@@ -1180,14 +1447,8 @@ def main() -> None:
                                 try:
                                     exit_mark = broker.get_ltp(pos.security_id, pos.exchange_segment)
                                 except Exception:
-                                    exit_mark = float(price_df["Close"].iloc[-1])
-                            realized = (exit_mark - pos.entry) * pos.qty if pos.side == "CE" else (pos.entry - exit_mark) * pos.qty
-                            st.session_state.daily_pnl += realized
-                            st.session_state.trade_log.append({
-                                **resp,
-                                "realized_pnl": realized,
-                                "exit_time": now_ist().isoformat(timespec="seconds"),
-                            })
+                                    exit_mark = estimated_option_price(current_spot, pos.entry_spot or current_spot, pos.side, cfg)
+                            realized = close_position_and_record(pos, exit_mark, "MANUAL", resp)
                             st.success(f"Exited. Realized P&L: ₹{realized:,.2f}")
                         else:
                             st.session_state.trade_log.append(resp)
@@ -1373,7 +1634,7 @@ def main() -> None:
         st.markdown("### Dhan live execution wiring")
         st.code(
             """
-1. Add your credentials to Streamlit secrets or environment variables:
+1. Add your credentials to `.streamlit/secrets.toml`:
    [dhan]
    client_id = "YOUR_CLIENT_ID"
    access_token = "YOUR_ACCESS_TOKEN"

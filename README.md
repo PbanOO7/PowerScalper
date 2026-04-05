@@ -1,131 +1,269 @@
 # PowerScalper
 
-PowerScalper is a Streamlit-based NIFTY options trading dashboard with:
+PowerScalper is a Streamlit app for index options signal generation, paper trading, backtesting, and staged Dhan live-trading integration.
 
-- live CE/PE signal generation
-- option strike selection
-- paper-trading execution flow
-- historical backtesting
-- a scaffold for Dhan live broker integration
+The project currently runs from a single main file: [live_trading_system.py](/Users/prithwish/Documents/Trading%20Code/PowerScalper/live_trading_system.py).
 
-The current project is implemented in a single file: [live_trading_system.py](/Users/prithwish/Documents/Trading%20Code/PowerScalper/live_trading_system.py).
+## What The App Does
 
-## What It Does
+The app:
 
-The app fetches NIFTY and India VIX market data using `yfinance`, computes technical indicators, classifies the market regime, and generates directional signals for call (`CE`) or put (`PE`) trades.
+- loads index OHLCV data from Yahoo Finance
+- loads India VIX data
+- calculates technical indicators
+- scores bullish and bearish setups
+- generates `CE` or `PE` trade signals
+- applies risk-managed position sizing
+- supports paper execution inside the app
+- runs a backtest using the same signal framework
+- includes a Dhan execution scaffold for future live deployment
 
-Core logic includes:
+Supported instruments in the current app:
 
-- EMA trend alignment
-- RSI confirmation
+- `NIFTY 50`
+- `BANKNIFTY`
+- `FINNIFTY`
+- `SENSEX`
+
+## Current Trading Model
+
+This app is designed around long option premium trades:
+
+- buy `CE` when the bullish setup is strong
+- buy `PE` when the bearish setup is strong
+- use premium-based stop loss and target
+- size quantity from account risk and lot size
+- block trading when the daily kill switch is triggered
+
+It is not selling options, and it is not a multi-leg options engine.
+
+## Strategy Logic
+
+Signals are built from a weighted score using:
+
+- `EMA 20` and `EMA 50`
+- `RSI`
 - Bollinger Band expansion
-- VWAP interaction
-- candle pattern classification
-- volume spike filtering
-- VIX-based regime detection
-- risk-based position sizing
+- VWAP behavior
+- candle classification
+- breakout / breakdown confirmation
+- volume spike filter
+- India VIX filter and regime detection
 
-The interface has three main sections:
+The app generates a trade only when the combined confidence score is above the configured threshold.
 
-- `Live Signals`: current signal, order execution controls, open positions, and trade log
-- `Backtest`: historical simulation of the same signal logic
-- `Live Wiring Notes`: instructions for connecting Dhan APIs
+## Risk Controls
 
-## Current Status
+The app includes the following controls:
 
-`PAPER` mode works as a simulation flow inside the Streamlit app.
+- risk per trade capped to `1%` to `2%` of capital
+- premium stop loss in the `20%` to `30%` range
+- premium target in the `40%` to `60%` range
+- max holding time, default `30` minutes
+- max daily loss limit
+- consecutive loss kill switch
+- max trades per day
+- capital allocation cap per trade
+- VIX threshold to avoid low-volatility chop
 
-`LIVE` mode is not production-ready yet. The `DhanBroker` class is only a placeholder and still needs:
+### Kill Switch
 
-- credential loading
-- instrument resolution
-- real order placement
-- exit handling
-- broker-side price and position tracking
+New trades are blocked for the day when either of these is hit:
 
-## Requirements
+- the configured daily loss limit
+- the configured consecutive loss limit
 
-- Python 3.10+
-- `streamlit`
-- `pandas`
-- `numpy`
-- `yfinance`
+## Paper Mode vs Live Mode
 
-Install dependencies:
+`PAPER` mode is the default and is the safe mode for normal use.
+
+`LIVE` mode is protected by:
+
+- explicit mode toggle
+- confirmation checkbox
+- Dhan credential check
+
+Even with those controls, live trading should still be treated as incomplete until you validate the full broker flow end to end.
+
+## Backtest Behavior
+
+The backtest engine reuses the same signal framework and applies:
+
+- premium-based entry and exit approximation
+- slippage
+- estimated brokerage / turnover costs
+- capital tracking
+- drawdown tracking
+- risk-based sizing
+- daily loss and consecutive-loss kill switches
+- max holding time exits
+- end-of-day exits
+
+### Important Backtest Limitation
+
+The backtest is more realistic than a raw spot approximation, but it still does not replay historical option-chain data tick by tick.
+
+Current backtests use an internal option-premium proxy model derived from underlying movement. That is useful for screening and iteration, but it is still an approximation.
+
+## Streamlit Layout
+
+The app has three tabs:
+
+### 1. `Live Signals`
+
+Use this tab to:
+
+- view the latest signal
+- inspect confidence, regime, stop, target, and suggested quantity
+- place paper orders
+- place live orders when enabled and confirmed
+- monitor open positions
+- manually exit positions
+- review the session trade log
+
+### 2. `Backtest`
+
+Use this tab to:
+
+- choose interval and lookback window
+- set a backtest preset
+- tune confidence, filters, slippage, and costs
+- run a backtest
+- inspect trades, PnL, drawdown, profit factor, and equity curve
+
+### 3. `Live Wiring Notes`
+
+Use this tab as a quick in-app reminder for Dhan integration and secrets configuration.
+
+## Sidebar Controls
+
+The main sidebar exposes the operating controls for the strategy:
+
+- instrument
+- trading mode: `PAPER` or `LIVE`
+- capital
+- `SL %`
+- `Target %`
+- risk per trade
+- max holding time
+- daily loss limit
+- consecutive loss limit
+- capital allocation cap
+- max trades per day
+- confidence threshold
+- VIX threshold
+- live bar interval
+- history period
+- strike selection
+- expiry code
+
+## How To Run
+
+### Requirements
+
+- Python `3.10+`
+- dependencies from [requirements.txt](/Users/prithwish/Documents/Trading%20Code/PowerScalper/requirements.txt)
+
+### Install
 
 ```bash
-pip install streamlit pandas numpy yfinance
+pip install -r requirements.txt
 ```
 
-## Running The App
-
-From the project root:
+### Start The App
 
 ```bash
 streamlit run live_trading_system.py
 ```
 
-Then open the local Streamlit URL shown in the terminal.
+Streamlit will print a local URL in the terminal. Open that URL in your browser.
 
-## How The Strategy Works
+## How To Use The App
 
-At a high level, the strategy:
+### Basic paper-trading workflow
 
-1. Downloads recent NIFTY OHLCV data and India VIX data.
-2. Enriches price data with indicators such as EMA, RSI, Bollinger Bands, rolling volume, and VWAP.
-3. Detects whether the market is `TRENDING`, `RANGE`, or `VOLATILE`.
-4. Scores bullish and bearish setups using trend, breakout, candle structure, RSI, VWAP, volume, and Bollinger expansion.
-5. Creates a `CE` or `PE` signal if the confidence threshold is met.
-6. Sizes the trade using account capital, stop loss distance, and lot size.
+1. Start the app.
+2. Keep trading mode on `PAPER`.
+3. Choose the instrument and expiry code.
+4. Set capital and risk controls.
+5. Review the live signal.
+6. If a valid signal appears and the risk check is `OK`, execute the paper order.
+7. Monitor open positions and trade log.
+8. Let the system hit stop, target, or time exit, or exit manually.
 
-## Backtesting
+### Basic backtest workflow
 
-The backtest engine reuses the same signal-generation logic and simulates:
+1. Open the `Backtest` tab.
+2. Select interval and period.
+3. Choose a preset.
+4. Adjust slippage and costs if needed.
+5. Run the backtest.
+6. Review trades, drawdown, return, and profit factor before changing live settings.
 
-- one open trade at a time
-- stop-loss exits
-- target exits
-- end-of-day exits
-- daily trade limits
-- max daily loss limits
+## Dhan Secrets Setup
 
-Reported metrics include:
+The app reads Dhan credentials from Streamlit secrets or environment variables.
 
-- total trades
-- win rate
-- net P&L
-- return percentage
-- max drawdown
-- profit factor
+Recommended approach:
 
-## Important Limitations
+1. Create `.streamlit/secrets.toml`
+2. Add:
 
-- Open-position P&L is estimated from spot index movement, not actual option premium movement.
-- `LIVE` mode will fail until `DhanBroker` is implemented.
-- The app currently stores runtime state in Streamlit session state only.
-- The project is monolithic right now; strategy logic, UI, backtesting, and execution live in one file.
-- This is an execution framework, not a guarantee of profitability.
+```toml
+[dhan]
+client_id = "YOUR_CLIENT_ID"
+access_token = "YOUR_ACCESS_TOKEN"
+```
 
-## Dhan Integration Notes
+A template is included at [.streamlit/secrets.toml.example](/Users/prithwish/Documents/Trading%20Code/PowerScalper/.streamlit/secrets.toml.example).
 
-To make live execution usable, extend `DhanBroker` in `live_trading_system.py` to:
+Environment variable fallback is also supported:
 
-- load `client_id` and `access_token`
-- map generated option symbols to tradable Dhan instruments
-- place orders through the broker API
-- exit open positions
-- fetch real prices for accurate P&L and risk handling
+```bash
+export DHAN_CLIENT_ID="YOUR_CLIENT_ID"
+export DHAN_ACCESS_TOKEN="YOUR_ACCESS_TOKEN"
+```
 
-The app already includes an in-app notes tab describing the intended integration flow.
+## Live Trading Status
+
+Live trading support is only partially implemented.
+
+What is already present:
+
+- Dhan credential loading
+- Dhan profile/status check
+- Dhan instrument master download
+- generated option symbol to Dhan contract resolution
+- market order request scaffold
+- LTP lookup for live mark prices
+
+What still needs careful validation before production use:
+
+- final order-state handling
+- persistent broker-side position syncing
+- websocket or postback-based fill tracking
+- production-safe live execution testing
+- better historical option pricing for backtests
 
 ## Project Structure
 
 ```text
 PowerScalper/
+├── .streamlit/
+│   └── secrets.toml.example
 ├── live_trading_system.py
-└── README.md
+├── README.md
+└── requirements.txt
 ```
+
+## Practical Notes
+
+- `PAPER` mode should be your default.
+- Treat backtest returns with caution because the pricing model is still synthetic.
+- Do not assume live and paper fills will match.
+- Streamlit session state is used for current-session positions and logs.
+- The app is still monolithic; strategy, UI, backtest, and execution scaffolding are all in one file.
 
 ## Disclaimer
 
-This project is for educational and development purposes. Test thoroughly in paper mode before connecting any live broker or risking capital.
+This project is for development and educational use. Test thoroughly in paper mode before attempting any broker-connected execution with real capital.

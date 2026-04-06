@@ -8,15 +8,16 @@ The project currently runs from a single main file: [live_trading_system.py](/Us
 
 The app:
 
-- loads index OHLCV data from Yahoo Finance
-- loads India VIX data
+- loads index OHLCV data from Dhan historical APIs
+- loads India VIX data from Dhan
 - calculates technical indicators
 - scores bullish and bearish setups
 - generates `CE` or `PE` trade signals
 - applies risk-managed position sizing
 - supports paper execution inside the app
 - runs a backtest using the same signal framework
-- includes a Dhan execution scaffold for future live deployment
+- uses Dhan instrument master and option-chain APIs for market structure and contract mapping
+- includes a Dhan execution scaffold for staged live deployment
 
 Supported instruments in the current app:
 
@@ -85,6 +86,17 @@ New trades are blocked for the day when either of these is hit:
 
 Even with those controls, live trading should still be treated as incomplete until you validate the full broker flow end to end.
 
+## Data Sources
+
+The app now uses Dhan for all market-data paths inside the Streamlit runtime:
+
+- index historical candles from Dhan `historical` / `intraday` APIs
+- India VIX history from Dhan
+- option-chain expiries and strike-level chain data from Dhan
+- instrument and contract resolution from Dhan's instrument master
+
+There is no longer a runtime dependency on Yahoo Finance.
+
 ## Backtest Behavior
 
 The backtest engine reuses the same signal framework and applies:
@@ -107,7 +119,7 @@ Current backtests use an internal option-premium proxy model derived from underl
 
 ## Streamlit Layout
 
-The app has three tabs:
+The app currently has five tabs:
 
 ### 1. `Live Signals`
 
@@ -131,9 +143,22 @@ Use this tab to:
 - run a backtest
 - inspect trades, PnL, drawdown, profit factor, and equity curve
 
-### 3. `Live Wiring Notes`
+### 3. `Option Chain`
+
+Use this tab to:
+
+- load Dhan expiry lists
+- inspect strike-wise `CE` / `PE` OI, volume, IV, bid, and ask
+- view ATM context and PCR summaries
+- review near-ATM positioning before execution
+
+### 4. `Live Wiring Notes`
 
 Use this tab as a quick in-app reminder for Dhan integration and secrets configuration.
+
+### 5. `Help`
+
+Use this tab for a short in-app operating guide and a link to the full repo documentation.
 
 ## Sidebar Controls
 
@@ -232,7 +257,9 @@ What is already present:
 
 - Dhan credential loading
 - Dhan profile/status check
+- Dhan historical price and India VIX loading
 - Dhan instrument master download
+- Dhan option-chain expiry and strike data
 - generated option symbol to Dhan contract resolution
 - market order request scaffold
 - LTP lookup for live mark prices

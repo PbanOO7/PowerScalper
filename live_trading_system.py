@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import yfinance as yf
 
 # ==========================================================
 # NIFTY LIVE TRADING SYSTEM
@@ -45,7 +44,7 @@ HELP_URL = "https://github.com/PbanOO7/PowerScalper#readme"
 
 INSTRUMENTS = {
     "NIFTY 50": {
-        "symbol": "^NSEI",
+        "underlying_security_id": 26000,
         "option_prefix": "NIFTY",
         "underlying_symbol": "NIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -55,7 +54,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "BANKNIFTY": {
-        "symbol": "^NSEBANK",
+        "underlying_security_id": 26009,
         "option_prefix": "BANKNIFTY",
         "underlying_symbol": "BANKNIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -65,7 +64,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "FINNIFTY": {
-        "symbol": "NIFTY_FIN_SERVICE.NS",
+        "underlying_security_id": 26037,
         "option_prefix": "FINNIFTY",
         "underlying_symbol": "FINNIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -75,7 +74,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "SENSEX": {
-        "symbol": "^BSESN",
+        "underlying_security_id": 1,
         "option_prefix": "SENSEX",
         "underlying_symbol": "SENSEX",
         "order_exchange_segment": "BSE_FNO",
@@ -84,6 +83,12 @@ INSTRUMENTS = {
         "strike_step": 100,
         "expiry_weekday": 3,
     },
+}
+
+VIX_META = {
+    "security_id": 21,
+    "exchange_segment": "IDX_I",
+    "instrument": "INDEX",
 }
 
 
@@ -117,6 +122,20 @@ def format_ist_timestamp(value: object, fmt: str = "%Y-%m-%d %H:%M:%S IST") -> s
     else:
         ts = ts.astimezone(IST)
     return ts.strftime(fmt)
+
+
+def period_to_dates(period: str) -> tuple[datetime, datetime]:
+    now = now_ist()
+    mapping = {
+        "5d": timedelta(days=5),
+        "10d": timedelta(days=10),
+        "1mo": timedelta(days=30),
+        "3mo": timedelta(days=90),
+        "6mo": timedelta(days=180),
+        "1y": timedelta(days=365),
+    }
+    delta = mapping.get(period, timedelta(days=30))
+    return now - delta, now
 
 
 def normalize_intraday_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -353,13 +372,12 @@ def ensure_login() -> None:
 
 @dataclass
 class StrategyConfig:
-    symbol: str = "^NSEI"
+    underlying_security_id: int = 26000
     instrument_name: str = "NIFTY 50"
     option_prefix: str = "NIFTY"
     underlying_symbol: str = "NIFTY"
     order_exchange_segment: str = "NSE_FNO"
     underlying_exchange_segment: str = "IDX_I"
-    vix_symbol: str = "^INDIAVIX"
     bar_interval: str = "5m"
     history_period: str = "10d"
     fast_ema: int = 20
@@ -550,6 +568,17 @@ class DhanBroker(BrokerInterface):
                 return instrument
         raise RuntimeError(f"No Dhan instrument metadata configured for option prefix `{option_prefix}`.")
 
+    def resolve_underlying_security_id(self, underlying_symbol: str) -> int:
+        instruments = load_dhan_instrument_master()
+        matches = instruments[instruments["UNDERLYING_SYMBOL"] == underlying_symbol.upper()].copy()
+        if matches.empty:
+            raise RuntimeError(f"No Dhan underlying security id found for `{underlying_symbol}`.")
+        matches["UNDERLYING_SECURITY_ID"] = pd.to_numeric(matches["UNDERLYING_SECURITY_ID"], errors="coerce")
+        matches = matches.dropna(subset=["UNDERLYING_SECURITY_ID"])
+        if matches.empty:
+            raise RuntimeError(f"Dhan instrument master does not contain a valid underlying security id for `{underlying_symbol}`.")
+        return int(matches["UNDERLYING_SECURITY_ID"].iloc[0])
+
     def resolve_option_contract(self, option_symbol: str) -> dict:
         option_prefix, expiry_date, strike, side = self._parse_option_symbol(option_symbol)
         meta = self._instrument_meta_from_prefix(option_prefix)
@@ -589,6 +618,75 @@ class DhanBroker(BrokerInterface):
         if price is None:
             raise RuntimeError(f"No LTP returned for security_id {security_id} in segment {exchange_segment}.")
         return float(price)
+
+    def get_option_chain_expiries(self, underlying_symbol: str, underlying_exchange_segment: str) -> list[str]:
+        security_id = self.resolve_underlying_security_id(underlying_symbol)
+        data = self._request(
+            "POST",
+            "/optionchain/expirylist",
+            payload={
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": underlying_exchange_segment,
+            },
+            include_client_id=True,
+        )
+        expiries = data.get("data", [])
+        return [str(expiry) for expiry in expiries]
+
+    def get_option_chain(self, underlying_symbol: str, underlying_exchange_segment: str, expiry: str) -> dict:
+        security_id = self.resolve_underlying_security_id(underlying_symbol)
+        return self._request(
+            "POST",
+            "/optionchain",
+            payload={
+                "UnderlyingScrip": security_id,
+                "UnderlyingSeg": underlying_exchange_segment,
+                "Expiry": expiry,
+            },
+            include_client_id=True,
+        )
+
+    def get_historical_data(
+        self,
+        security_id: int,
+        exchange_segment: str,
+        instrument: str,
+        *,
+        interval: Optional[str] = None,
+        from_dt: datetime,
+        to_dt: datetime,
+        oi: bool = False,
+    ) -> pd.DataFrame:
+        path = "/charts/intraday" if interval else "/charts/historical"
+        payload = {
+            "securityId": str(security_id),
+            "exchangeSegment": exchange_segment,
+            "instrument": instrument,
+            "oi": oi,
+        }
+        if interval:
+            payload["interval"] = interval
+            payload["fromDate"] = from_dt.strftime("%Y-%m-%d %H:%M:%S")
+            payload["toDate"] = to_dt.strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            payload["expiryCode"] = 0
+            payload["fromDate"] = from_dt.strftime("%Y-%m-%d")
+            payload["toDate"] = to_dt.strftime("%Y-%m-%d")
+
+        data = self._request("POST", path, payload=payload)
+        frame = pd.DataFrame({
+            "Open": data.get("open", []),
+            "High": data.get("high", []),
+            "Low": data.get("low", []),
+            "Close": data.get("close", []),
+            "Volume": data.get("volume", []),
+            "OpenInterest": data.get("open_interest", []),
+        })
+        timestamps = data.get("timestamp", [])
+        if frame.empty or not timestamps:
+            return pd.DataFrame()
+        frame.index = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(IST)
+        return frame
 
     def status(self) -> tuple[bool, str]:
         if not self.client_id or not self.access_token:
@@ -972,6 +1070,67 @@ def estimate_backtest_costs(entry_price: float, exit_price: float, qty: int, cfg
     return variable_cost + fixed_cost
 
 
+def option_chain_to_dataframe(chain_response: dict) -> pd.DataFrame:
+    oc = chain_response.get("data", {}).get("oc", {})
+    rows = []
+    for strike, node in oc.items():
+        ce = node.get("ce", {}) or {}
+        pe = node.get("pe", {}) or {}
+        rows.append({
+            "strike": float(strike),
+            "ce_ltp": ce.get("last_price"),
+            "ce_oi": ce.get("oi"),
+            "ce_volume": ce.get("volume"),
+            "ce_iv": ce.get("implied_volatility"),
+            "ce_bid": ce.get("top_bid_price"),
+            "ce_ask": ce.get("top_ask_price"),
+            "ce_security_id": ce.get("security_id"),
+            "ce_delta": (ce.get("greeks") or {}).get("delta"),
+            "pe_ltp": pe.get("last_price"),
+            "pe_oi": pe.get("oi"),
+            "pe_volume": pe.get("volume"),
+            "pe_iv": pe.get("implied_volatility"),
+            "pe_bid": pe.get("top_bid_price"),
+            "pe_ask": pe.get("top_ask_price"),
+            "pe_security_id": pe.get("security_id"),
+            "pe_delta": (pe.get("greeks") or {}).get("delta"),
+        })
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows).sort_values("strike").reset_index(drop=True)
+    numeric_cols = [col for col in frame.columns if col != "ce_security_id" and col != "pe_security_id"]
+    frame[numeric_cols] = frame[numeric_cols].apply(pd.to_numeric, errors="coerce")
+    return frame
+
+
+def option_chain_summary(chain_response: dict, chain_df: pd.DataFrame) -> dict:
+    last_price = float(chain_response.get("data", {}).get("last_price", 0.0))
+    if chain_df.empty:
+        return {
+            "last_price": last_price,
+            "atm_strike": None,
+            "pcr_oi": 0.0,
+            "pcr_volume": 0.0,
+            "max_call_oi_strike": None,
+            "max_put_oi_strike": None,
+        }
+    ce_oi_total = float(chain_df["ce_oi"].fillna(0).sum())
+    pe_oi_total = float(chain_df["pe_oi"].fillna(0).sum())
+    ce_vol_total = float(chain_df["ce_volume"].fillna(0).sum())
+    pe_vol_total = float(chain_df["pe_volume"].fillna(0).sum())
+    atm_idx = (chain_df["strike"] - last_price).abs().idxmin()
+    max_call_idx = chain_df["ce_oi"].fillna(-1).idxmax()
+    max_put_idx = chain_df["pe_oi"].fillna(-1).idxmax()
+    return {
+        "last_price": last_price,
+        "atm_strike": float(chain_df.loc[atm_idx, "strike"]),
+        "pcr_oi": pe_oi_total / ce_oi_total if ce_oi_total > 0 else 0.0,
+        "pcr_volume": pe_vol_total / ce_vol_total if ce_vol_total > 0 else 0.0,
+        "max_call_oi_strike": float(chain_df.loc[max_call_idx, "strike"]) if max_call_idx in chain_df.index else None,
+        "max_put_oi_strike": float(chain_df.loc[max_put_idx, "strike"]) if max_put_idx in chain_df.index else None,
+    }
+
+
 def estimated_option_price(spot_now: float, spot_entry: float, side: SignalSide, cfg: StrategyConfig) -> float:
     base_premium = max(spot_entry * (cfg.option_price_factor_pct / 100), 20.0)
     intrinsic = max(spot_now - spot_entry, 0.0) if side == "CE" else max(spot_entry - spot_now, 0.0)
@@ -1260,25 +1419,70 @@ def risk_checks(
 # Data fetch
 # -----------------------------
 @st.cache_data(ttl=60)
-def load_price_data(symbol: str, interval: str, period: str) -> pd.DataFrame:
-    df = yf.download(symbol, interval=interval, period=period, auto_adjust=True, progress=False)
-    if df is None or df.empty:
+def load_price_data(
+    security_id: int,
+    exchange_segment: str,
+    interval: str,
+    period: str,
+    instrument: str = "INDEX",
+) -> pd.DataFrame:
+    broker = DhanBroker()
+    ready, _ = broker.status()
+    if not ready:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
-    df = df.dropna().copy()
-    if interval in {"5m", "15m", "30m", "60m", "90m", "1h"}:
-        df = normalize_intraday_data(df)
+    from_dt, to_dt = period_to_dates(period)
+    requested_interval = interval
+    fetch_interval = interval
+    if interval == "30m":
+        fetch_interval = "5"
+    elif interval == "5m":
+        fetch_interval = "5"
+    elif interval == "15m":
+        fetch_interval = "15"
+    else:
+        fetch_interval = interval.replace("m", "")
+
+    df = broker.get_historical_data(
+        security_id,
+        exchange_segment,
+        instrument,
+        interval=fetch_interval,
+        from_dt=from_dt,
+        to_dt=to_dt,
+    )
+    if df.empty:
+        return df
+    df = normalize_intraday_data(df)
+    if requested_interval == "30m":
+        df = (
+            df.resample("30min", origin="start_day")
+            .agg({
+                "Open": "first",
+                "High": "max",
+                "Low": "min",
+                "Close": "last",
+                "Volume": "sum",
+                "OpenInterest": "last",
+            })
+            .dropna(subset=["Open", "High", "Low", "Close"])
+        )
     return df
 
 
 @st.cache_data(ttl=900)
-def load_vix_data(symbol: str = "^INDIAVIX", period: str = "1y") -> pd.DataFrame:
-    df = yf.download(symbol, interval="1d", period=period, auto_adjust=True, progress=False)
-    if df is None or df.empty:
+def load_vix_data(period: str = "1y") -> pd.DataFrame:
+    broker = DhanBroker()
+    ready, _ = broker.status()
+    if not ready:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+    from_dt, to_dt = period_to_dates(period)
+    df = broker.get_historical_data(
+        VIX_META["security_id"],
+        VIX_META["exchange_segment"],
+        VIX_META["instrument"],
+        from_dt=from_dt,
+        to_dt=to_dt,
+    )
     return df.dropna().copy()
 
 
@@ -1305,12 +1509,13 @@ def load_dhan_instrument_master() -> pd.DataFrame:
     df["OPTION_TYPE"] = df["OPTION_TYPE"].astype(str).str.upper()
     df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce").dt.date
     df["STRIKE_PRICE"] = pd.to_numeric(df["STRIKE_PRICE"], errors="coerce")
+    df["UNDERLYING_SECURITY_ID"] = pd.to_numeric(df["UNDERLYING_SECURITY_ID"], errors="coerce")
     df["SECURITY_ID"] = df["SECURITY_ID"].astype("Int64").astype(str)
     return df
 
 
 def supported_backtest_periods(interval: str) -> list[str]:
-    # Yahoo Finance intraday intervals are limited to roughly the last 60 days.
+    # Dhan intraday history is fetched in minute bars and resampled locally when needed.
     if interval in {"5m", "15m", "30m"}:
         return ["5d", "1mo"]
     return ["1mo", "3mo", "6mo"]
@@ -1336,6 +1541,14 @@ def init_state() -> None:
         st.session_state.trade_day = str(now_ist().date())
     if "day_start_capital" not in st.session_state:
         st.session_state.day_start_capital = 100000.0
+    if "option_chain_payload" not in st.session_state:
+        st.session_state.option_chain_payload = None
+    if "option_chain_expiries" not in st.session_state:
+        st.session_state.option_chain_expiries = []
+    if "option_chain_instrument" not in st.session_state:
+        st.session_state.option_chain_instrument = None
+    if "option_chain_loaded_expiry" not in st.session_state:
+        st.session_state.option_chain_loaded_expiry = None
 
 
 # -----------------------------
@@ -1390,14 +1603,14 @@ def main() -> None:
         )
         st.caption(
             f"Lot size: {instrument['lot_size']} | Strike step: {instrument['strike_step']} | "
-            f"Yahoo symbol: `{instrument['symbol']}`"
+            f"Dhan underlying security ID: `{instrument['underlying_security_id']}`"
         )
         st.markdown(f"[Help: How to use this app]({HELP_URL})")
         refresh = st.button("Refresh Signals", use_container_width=True)
         auto_refresh = st.checkbox("Auto-refresh every 60 sec", value=False)
 
     cfg = StrategyConfig(
-        symbol=instrument["symbol"],
+        underlying_security_id=instrument["underlying_security_id"],
         instrument_name=instrument_name,
         option_prefix=instrument["option_prefix"],
         underlying_symbol=instrument["underlying_symbol"],
@@ -1430,7 +1643,15 @@ def main() -> None:
     broker: BrokerInterface = PaperBroker() if mode == "PAPER" else DhanBroker()
     live_ready, live_reason = broker.status()
 
-    live_tab, backtest_tab, notes_tab, help_tab = st.tabs(["Live Signals", "Backtest", "Live Wiring Notes", "Help"])
+    if st.session_state.option_chain_instrument != instrument_name:
+        st.session_state.option_chain_instrument = instrument_name
+        st.session_state.option_chain_payload = None
+        st.session_state.option_chain_expiries = []
+        st.session_state.option_chain_loaded_expiry = None
+
+    live_tab, backtest_tab, chain_tab, notes_tab, help_tab = st.tabs(
+        ["Live Signals", "Backtest", "Option Chain", "Live Wiring Notes", "Help"]
+    )
 
     with live_tab:
         if mode == "LIVE":
@@ -1439,11 +1660,16 @@ def main() -> None:
             else:
                 st.error(f"LIVE broker status: {live_reason}")
 
-        price_df = load_price_data(cfg.symbol, cfg.bar_interval, cfg.history_period)
-        vix_df = load_vix_data(cfg.vix_symbol)
+        price_df = load_price_data(
+            cfg.underlying_security_id,
+            cfg.underlying_exchange_segment,
+            cfg.bar_interval,
+            cfg.history_period,
+        )
+        vix_df = load_vix_data()
 
         if price_df.empty:
-            st.error(f"Could not load {cfg.instrument_name} data for Yahoo symbol `{cfg.symbol}`.")
+            st.error(f"Could not load {cfg.instrument_name} price data from Dhan.")
             return
 
         if vix_df.empty:
@@ -1798,8 +2024,13 @@ def main() -> None:
         run_bt = st.button("Run Backtest", use_container_width=True)
 
         if run_bt:
-            bt_price = load_price_data(cfg.symbol, bt_interval, bt_period)
-            bt_vix = load_vix_data(cfg.vix_symbol)
+            bt_price = load_price_data(
+                cfg.underlying_security_id,
+                cfg.underlying_exchange_segment,
+                bt_interval,
+                bt_period,
+            )
+            bt_vix = load_vix_data()
             bt_cfg = StrategyConfig(
                 **{
                     **cfg.__dict__,
@@ -1818,7 +2049,7 @@ def main() -> None:
             if bt_price.empty:
                 st.warning(
                     f"No backtest price data was returned for interval `{bt_interval}` and period `{bt_period}`. "
-                    "Yahoo Finance only provides intraday data for a limited recent window."
+                    "Dhan historical data did not return candles for the selected range."
                 )
             else:
                 st.caption(
@@ -1854,6 +2085,128 @@ def main() -> None:
                         st.line_chart(equity)
                     else:
                         st.info("No trades generated in the selected backtest window.")
+
+    with chain_tab:
+        st.markdown("### Dhan Option Chain")
+        chain_broker = DhanBroker()
+        chain_ready, chain_reason = chain_broker.status()
+        if chain_ready:
+            st.info(f"Dhan data status: {chain_reason}")
+        else:
+            st.error(f"Dhan data status: {chain_reason}")
+
+        expiry_left, expiry_right = st.columns([2, 1])
+        with expiry_right:
+            refresh_chain = st.button("Refresh Chain", use_container_width=True, disabled=not chain_ready)
+
+        if chain_ready and (refresh_chain or not st.session_state.option_chain_expiries):
+            try:
+                st.session_state.option_chain_expiries = chain_broker.get_option_chain_expiries(
+                    instrument["underlying_symbol"],
+                    instrument["underlying_exchange_segment"],
+                )
+            except Exception as exc:
+                st.error(f"Could not load Dhan expiry list: {exc}")
+
+        expiries = st.session_state.option_chain_expiries
+        if not expiries:
+            st.warning("No option-chain expiries available yet. Check Dhan credentials or refresh again.")
+        else:
+            with expiry_left:
+                selected_chain_expiry = st.selectbox("Dhan option-chain expiry", expiries, index=0, key="selected_chain_expiry")
+
+            if chain_ready and (
+                refresh_chain
+                or st.session_state.option_chain_payload is None
+                or st.session_state.option_chain_loaded_expiry != selected_chain_expiry
+            ):
+                try:
+                    st.session_state.option_chain_payload = chain_broker.get_option_chain(
+                        instrument["underlying_symbol"],
+                        instrument["underlying_exchange_segment"],
+                        selected_chain_expiry,
+                    )
+                    st.session_state.option_chain_loaded_expiry = selected_chain_expiry
+                except Exception as exc:
+                    st.error(f"Could not load Dhan option chain: {exc}")
+
+            chain_payload = st.session_state.option_chain_payload
+            chain_df = option_chain_to_dataframe(chain_payload or {})
+            chain_stats = option_chain_summary(chain_payload or {}, chain_df)
+
+            top_cols = st.columns(5)
+            top_cols[0].metric("Underlying", f"{chain_stats['last_price']:,.2f}")
+            top_cols[1].metric("ATM Strike", "-" if chain_stats["atm_strike"] is None else f"{chain_stats['atm_strike']:,.0f}")
+            top_cols[2].metric("PCR (OI)", f"{chain_stats['pcr_oi']:.2f}")
+            top_cols[3].metric("Max Call OI", "-" if chain_stats["max_call_oi_strike"] is None else f"{chain_stats['max_call_oi_strike']:,.0f}")
+            top_cols[4].metric("Max Put OI", "-" if chain_stats["max_put_oi_strike"] is None else f"{chain_stats['max_put_oi_strike']:,.0f}")
+
+            if chain_df.empty:
+                st.info("No option-chain rows were returned by Dhan for this expiry.")
+            else:
+                atm_strike = chain_stats["atm_strike"] or float(chain_df["strike"].iloc[0])
+                atm_slice = chain_df.iloc[(chain_df["strike"] - atm_strike).abs().argsort()[:11]].sort_values("strike")
+                atm_row = chain_df.loc[(chain_df["strike"] - atm_strike).abs().idxmin()]
+
+                snap_left, snap_right = st.columns(2)
+                with snap_left:
+                    st.markdown("#### ATM Snapshot")
+                    st.write(f"**Call LTP:** ₹{(atm_row.get('ce_ltp') or 0):.2f}")
+                    st.write(f"**Call OI:** {int(atm_row.get('ce_oi') or 0):,}")
+                    st.write(f"**Call Volume:** {int(atm_row.get('ce_volume') or 0):,}")
+                    st.write(f"**Call IV:** {float(atm_row.get('ce_iv') or 0):.2f}")
+                with snap_right:
+                    st.markdown("#### Put Snapshot")
+                    st.write(f"**Put LTP:** ₹{(atm_row.get('pe_ltp') or 0):.2f}")
+                    st.write(f"**Put OI:** {int(atm_row.get('pe_oi') or 0):,}")
+                    st.write(f"**Put Volume:** {int(atm_row.get('pe_volume') or 0):,}")
+                    st.write(f"**Put IV:** {float(atm_row.get('pe_iv') or 0):.2f}")
+
+                oi_chart = atm_slice[["strike", "ce_oi", "pe_oi"]].set_index("strike").rename(
+                    columns={"ce_oi": "Call OI", "pe_oi": "Put OI"}
+                )
+                vol_chart = atm_slice[["strike", "ce_volume", "pe_volume"]].set_index("strike").rename(
+                    columns={"ce_volume": "Call Volume", "pe_volume": "Put Volume"}
+                )
+                st.markdown("#### Near-ATM OI")
+                st.bar_chart(oi_chart)
+                st.markdown("#### Near-ATM Volume")
+                st.bar_chart(vol_chart)
+
+                display_chain = chain_df.rename(
+                    columns={
+                        "strike": "Strike",
+                        "ce_ltp": "CE LTP",
+                        "ce_oi": "CE OI",
+                        "ce_volume": "CE Volume",
+                        "ce_iv": "CE IV",
+                        "ce_bid": "CE Bid",
+                        "ce_ask": "CE Ask",
+                        "pe_ltp": "PE LTP",
+                        "pe_oi": "PE OI",
+                        "pe_volume": "PE Volume",
+                        "pe_iv": "PE IV",
+                        "pe_bid": "PE Bid",
+                        "pe_ask": "PE Ask",
+                    }
+                )
+                keep_cols = [
+                    "Strike",
+                    "CE LTP",
+                    "CE OI",
+                    "CE Volume",
+                    "CE IV",
+                    "CE Bid",
+                    "CE Ask",
+                    "PE Bid",
+                    "PE Ask",
+                    "PE IV",
+                    "PE Volume",
+                    "PE OI",
+                    "PE LTP",
+                ]
+                st.markdown("#### Full Strike Table")
+                st.dataframe(display_chain[keep_cols], use_container_width=True)
 
     with notes_tab:
         st.markdown("### Dhan live execution wiring")

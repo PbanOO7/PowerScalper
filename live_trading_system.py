@@ -44,7 +44,7 @@ HELP_URL = "https://github.com/PbanOO7/PowerScalper#readme"
 
 INSTRUMENTS = {
     "NIFTY 50": {
-        "underlying_security_id": 26000,
+        "underlying_security_id": 13,
         "option_prefix": "NIFTY",
         "underlying_symbol": "NIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -54,7 +54,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "BANKNIFTY": {
-        "underlying_security_id": 26009,
+        "underlying_security_id": 25,
         "option_prefix": "BANKNIFTY",
         "underlying_symbol": "BANKNIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -64,7 +64,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "FINNIFTY": {
-        "underlying_security_id": 26037,
+        "underlying_security_id": 27,
         "option_prefix": "FINNIFTY",
         "underlying_symbol": "FINNIFTY",
         "order_exchange_segment": "NSE_FNO",
@@ -74,7 +74,7 @@ INSTRUMENTS = {
         "expiry_weekday": 1,
     },
     "SENSEX": {
-        "underlying_security_id": 1,
+        "underlying_security_id": 51,
         "option_prefix": "SENSEX",
         "underlying_symbol": "SENSEX",
         "order_exchange_segment": "BSE_FNO",
@@ -569,15 +569,8 @@ class DhanBroker(BrokerInterface):
         raise RuntimeError(f"No Dhan instrument metadata configured for option prefix `{option_prefix}`.")
 
     def resolve_underlying_security_id(self, underlying_symbol: str) -> int:
-        instruments = load_dhan_instrument_master()
-        matches = instruments[instruments["UNDERLYING_SYMBOL"] == underlying_symbol.upper()].copy()
-        if matches.empty:
-            raise RuntimeError(f"No Dhan underlying security id found for `{underlying_symbol}`.")
-        matches["UNDERLYING_SECURITY_ID"] = pd.to_numeric(matches["UNDERLYING_SECURITY_ID"], errors="coerce")
-        matches = matches.dropna(subset=["UNDERLYING_SECURITY_ID"])
-        if matches.empty:
-            raise RuntimeError(f"Dhan instrument master does not contain a valid underlying security id for `{underlying_symbol}`.")
-        return int(matches["UNDERLYING_SECURITY_ID"].iloc[0])
+        meta = self._instrument_meta_from_prefix(underlying_symbol)
+        return int(meta["underlying_security_id"])
 
     def resolve_option_contract(self, option_symbol: str) -> dict:
         option_prefix, expiry_date, strike, side = self._parse_option_symbol(option_symbol)

@@ -409,6 +409,11 @@ class StrategyConfig:
     use_regime_filter: bool = True
     use_volume_filter: bool = True
     use_bb_filter: bool = True
+    use_option_chain_filter: bool = True
+    option_chain_min_volume: int = 500
+    option_chain_max_spread_pct: float = 8.0
+    option_chain_support_ratio: float = 0.9
+    option_chain_confidence_bonus: float = 0.03
     backtest_slippage_pct: float = 0.0015
     backtest_cost_pct: float = 0.0010
     backtest_fixed_cost_per_order: float = 20.0
@@ -448,6 +453,15 @@ class Position:
     entry_spot: Optional[float] = None
     stop_loss_spot: Optional[float] = None
     target_spot: Optional[float] = None
+
+
+@dataclass
+class ChainFilterResult:
+    passes: bool
+    reason: str
+    spread_pct: float = 0.0
+    option_volume: float = 0.0
+    support_ratio: float = 0.0
 
 
 # -----------------------------
@@ -915,6 +929,27 @@ def infer_nearest_weekly_expiry(now: Optional[datetime] = None, expiry_weekday: 
     return expiry.strftime("%d%b%y").upper()
 
 
+def expiry_code_to_chain_expiry(expiry_code: str) -> Optional[str]:
+    try:
+        return datetime.strptime(expiry_code.upper(), "%d%b%y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def resolve_chain_expiry(expiry_code: str, expiries: list[str]) -> Optional[str]:
+    if not expiries:
+        return None
+    target = expiry_code_to_chain_expiry(expiry_code)
+    if target is None:
+        return expiries[0]
+    if target in expiries:
+        return target
+    future = [expiry for expiry in expiries if expiry >= target]
+    if future:
+        return future[0]
+    return expiries[-1]
+
+
 # -----------------------------
 # Signal engine
 # -----------------------------
@@ -1137,6 +1172,83 @@ def option_chain_summary(chain_response: dict, chain_df: pd.DataFrame) -> dict:
         "max_call_oi_strike": float(chain_df.loc[max_call_idx, "strike"]) if max_call_idx in chain_df.index else None,
         "max_put_oi_strike": float(chain_df.loc[max_put_idx, "strike"]) if max_put_idx in chain_df.index else None,
     }
+
+
+@st.cache_data(ttl=60)
+def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segment: str) -> list[str]:
+    broker = DhanBroker()
+    ready, _ = broker.status()
+    if not ready:
+        return []
+    return broker.get_option_chain_expiries(underlying_symbol, underlying_exchange_segment)
+
+
+@st.cache_data(ttl=60)
+def load_option_chain_payload(underlying_symbol: str, underlying_exchange_segment: str, expiry: str) -> dict:
+    broker = DhanBroker()
+    ready, _ = broker.status()
+    if not ready:
+        return {}
+    return broker.get_option_chain(underlying_symbol, underlying_exchange_segment, expiry)
+
+
+def evaluate_option_chain_filter(
+    chain_payload: dict,
+    signal: Signal,
+    strike: int,
+    cfg: StrategyConfig,
+) -> ChainFilterResult:
+    chain_df = option_chain_to_dataframe(chain_payload)
+    if chain_df.empty:
+        return ChainFilterResult(False, "Option chain is unavailable for the selected expiry.")
+
+    row_idx = (chain_df["strike"] - float(strike)).abs().idxmin()
+    row = chain_df.loc[row_idx]
+    prefix = "ce" if signal.side == "CE" else "pe"
+    same_oi_col = "ce_oi" if signal.side == "CE" else "pe_oi"
+    opposite_oi_col = "pe_oi" if signal.side == "CE" else "ce_oi"
+    volume = float(row.get(f"{prefix}_volume") or 0.0)
+    bid = float(row.get(f"{prefix}_bid") or 0.0)
+    ask = float(row.get(f"{prefix}_ask") or 0.0)
+    ltp = float(row.get(f"{prefix}_ltp") or 0.0)
+    same_oi = float(row.get(same_oi_col) or 0.0)
+    opposite_oi = float(row.get(opposite_oi_col) or 0.0)
+    support_ratio = opposite_oi / max(same_oi, 1.0)
+    spread_base = ltp if ltp > 0 else max((bid + ask) / 2.0, 1.0)
+    spread_pct = ((ask - bid) / spread_base * 100.0) if ask > 0 and bid > 0 and spread_base > 0 else 999.0
+
+    if volume < cfg.option_chain_min_volume:
+        return ChainFilterResult(
+            False,
+            f"Option chain rejected {signal.side}: strike volume {volume:,.0f} is below {cfg.option_chain_min_volume}.",
+            spread_pct=spread_pct,
+            option_volume=volume,
+            support_ratio=support_ratio,
+        )
+    if spread_pct > cfg.option_chain_max_spread_pct:
+        return ChainFilterResult(
+            False,
+            f"Option chain rejected {signal.side}: spread {spread_pct:.2f}% is above {cfg.option_chain_max_spread_pct:.2f}%.",
+            spread_pct=spread_pct,
+            option_volume=volume,
+            support_ratio=support_ratio,
+        )
+    if support_ratio < cfg.option_chain_support_ratio:
+        return ChainFilterResult(
+            False,
+            f"Option chain rejected {signal.side}: opposing OI support {support_ratio:.2f}x is below {cfg.option_chain_support_ratio:.2f}x.",
+            spread_pct=spread_pct,
+            option_volume=volume,
+            support_ratio=support_ratio,
+        )
+
+    return ChainFilterResult(
+        True,
+        f"Chain OK: spread {spread_pct:.2f}% | volume {volume:,.0f} | support {support_ratio:.2f}x",
+        spread_pct=spread_pct,
+        option_volume=volume,
+        support_ratio=support_ratio,
+    )
 
 
 def estimated_option_price(spot_now: float, spot_entry: float, side: SignalSide, cfg: StrategyConfig) -> float:
@@ -1600,6 +1712,10 @@ def main() -> None:
         min_vix_trade = st.slider("VIX threshold", 10.0, 20.0, 13.0, 0.5)
         low_vix = st.slider("Low VIX regime threshold", 10.0, 18.0, 14.0, 0.5)
         high_vix = st.slider("High VIX threshold", 14.0, 25.0, 18.0, 0.5)
+        use_chain_filter = st.checkbox("Use option-chain filter", value=True)
+        chain_min_volume = st.number_input("Chain min strike volume", min_value=0, value=500, step=100)
+        chain_max_spread = st.slider("Chain max spread (%)", 1.0, 20.0, 8.0, 0.5)
+        chain_support_ratio = st.slider("Chain support ratio", 0.5, 2.0, 0.9, 0.05)
         interval = st.selectbox("Live bar interval", ["5m", "15m", "30m"], index=0)
         period = st.selectbox("Live history period", ["5d", "10d", "1mo"], index=1)
         strike_mode = st.selectbox("Strike selection", ["ATM", "ITM1", "OTM1"], index=0)
@@ -1640,6 +1756,10 @@ def main() -> None:
         min_vix_trade_threshold=min_vix_trade,
         low_vix_threshold=low_vix,
         high_vix_threshold=high_vix,
+        use_option_chain_filter=use_chain_filter,
+        option_chain_min_volume=int(chain_min_volume),
+        option_chain_max_spread_pct=chain_max_spread,
+        option_chain_support_ratio=chain_support_ratio,
         allow_live_orders=(mode == "LIVE" and live_confirmed),
         option_moneyness=strike_mode,
     )
@@ -1689,6 +1809,34 @@ def main() -> None:
             vix_prev = float(vix_df["Close"].iloc[-2]) if len(vix_df) > 1 else None
 
         signal = build_signal(price_df, vix_now, vix_prev, cfg)
+        chain_filter_result: Optional[ChainFilterResult] = None
+        no_trade_reason: Optional[str] = None
+        if signal is not None and cfg.use_option_chain_filter:
+            option_strike = choose_strike(signal.entry, signal.side, cfg.option_moneyness, cfg.strike_step)
+            try:
+                chain_expiries = load_option_chain_expiries(
+                    cfg.underlying_symbol,
+                    cfg.underlying_exchange_segment,
+                )
+                selected_chain_expiry = resolve_chain_expiry(expiry_code, chain_expiries)
+                if not selected_chain_expiry:
+                    chain_filter_result = ChainFilterResult(False, "No Dhan option-chain expiry is available for this instrument.")
+                else:
+                    chain_payload = load_option_chain_payload(
+                        cfg.underlying_symbol,
+                        cfg.underlying_exchange_segment,
+                        selected_chain_expiry,
+                    )
+                    chain_filter_result = evaluate_option_chain_filter(chain_payload, signal, option_strike, cfg)
+            except Exception as exc:
+                chain_filter_result = ChainFilterResult(False, f"Option-chain filter failed: {exc}")
+
+            if chain_filter_result and chain_filter_result.passes:
+                signal.confidence = round(min(signal.confidence + cfg.option_chain_confidence_bonus, 0.99), 3)
+                signal.reason = f"{signal.reason} | {chain_filter_result.reason}"
+            elif chain_filter_result:
+                no_trade_reason = chain_filter_result.reason
+                signal = None
         current_regime = detect_regime(vix_now, vix_prev, cfg)
 
         c1, c2, c3, c4 = st.columns(4)
@@ -1712,6 +1860,8 @@ def main() -> None:
         if signal is None:
             if vix_now < cfg.min_vix_trade_threshold:
                 st.info(f"No trade: India VIX {vix_now:.2f} is below the trade threshold of {cfg.min_vix_trade_threshold:.2f}.")
+            elif no_trade_reason:
+                st.info(f"No trade: {no_trade_reason}")
             else:
                 st.info("No valid CE/PE setup right now. Stay flat.")
         else:
@@ -1758,6 +1908,8 @@ def main() -> None:
                 st.write(f"**Option Symbol:** `{option_symbol}`")
                 st.write(f"**Reason:** {signal.reason}")
                 st.write(f"**Risk Check:** {reason}")
+                if chain_filter_result:
+                    st.write(f"**Option Chain Filter:** {chain_filter_result.reason}")
 
                 signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
                 can_fire = (

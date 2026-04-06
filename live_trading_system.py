@@ -667,18 +667,33 @@ class DhanBroker(BrokerInterface):
             payload["toDate"] = to_dt.strftime("%Y-%m-%d")
 
         data = self._request("POST", path, payload=payload)
-        frame = pd.DataFrame({
-            "Open": data.get("open", []),
-            "High": data.get("high", []),
-            "Low": data.get("low", []),
-            "Close": data.get("close", []),
-            "Volume": data.get("volume", []),
-            "OpenInterest": data.get("open_interest", []),
-        })
-        timestamps = data.get("timestamp", [])
-        if frame.empty or not timestamps:
+        series_map = {
+            "Open": list(data.get("open", []) or []),
+            "High": list(data.get("high", []) or []),
+            "Low": list(data.get("low", []) or []),
+            "Close": list(data.get("close", []) or []),
+            "Volume": list(data.get("volume", []) or []),
+            "OpenInterest": list(data.get("open_interest", []) or []),
+        }
+        timestamps = list(data.get("timestamp", []) or [])
+        if not timestamps:
             return pd.DataFrame()
-        frame.index = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(IST)
+
+        required = ["Open", "High", "Low", "Close"]
+        lengths = [len(timestamps)] + [len(series_map[key]) for key in required if series_map[key]]
+        if not lengths or min(lengths) == 0:
+            return pd.DataFrame()
+        size = min(lengths)
+
+        normalized = {key: values[:size] for key, values in series_map.items() if values}
+        for key in ("Volume", "OpenInterest"):
+            if key not in normalized:
+                normalized[key] = [0.0] * size
+            elif len(normalized[key]) < size:
+                normalized[key] = normalized[key] + [0.0] * (size - len(normalized[key]))
+
+        frame = pd.DataFrame(normalized)
+        frame.index = pd.to_datetime(timestamps[:size], unit="s", utc=True).tz_convert(IST)
         return frame
 
     def status(self) -> tuple[bool, str]:

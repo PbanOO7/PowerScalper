@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hmac
+import json
 import math
 import os
 import time
 import io
+import sqlite3
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, Literal
+from typing import Any, Optional, Literal
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -32,8 +35,6 @@ import streamlit as st
 # 3. This is a disciplined execution framework, not a profit guarantee.
 # ==========================================================
 
-st.set_page_config(page_title="NIFTY Live Trading System", layout="wide")
-
 TradeMode = Literal["PAPER", "LIVE"]
 SignalSide = Literal["CE", "PE"]
 Regime = Literal["TRENDING", "RANGE", "VOLATILE"]
@@ -41,6 +42,9 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN_TIME = "09:15"
 MARKET_CLOSE_TIME = "15:30"
 HELP_URL = "https://github.com/PbanOO7/PowerScalper#readme"
+BASE_DIR = Path(__file__).resolve().parent
+RUNTIME_DIR = BASE_DIR / "runtime"
+WORKER_DB_PATH = RUNTIME_DIR / "worker_state.db"
 
 INSTRUMENTS = {
     "NIFTY 50": {
@@ -168,6 +172,10 @@ def read_secret(section: str, key: str) -> Optional[str]:
 
 def auth_credentials() -> tuple[Optional[str], Optional[str]]:
     return read_secret("auth", "username"), read_secret("auth", "password")
+
+
+def configure_streamlit_page() -> None:
+    st.set_page_config(page_title="NIFTY Live Trading System", layout="wide")
 
 
 def render_login_shell():
@@ -486,6 +494,191 @@ class ChainFilterResult:
     spread_pct: float = 0.0
     option_volume: float = 0.0
     support_ratio: float = 0.0
+
+
+def ensure_runtime_dir() -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def worker_db_connection() -> sqlite3.Connection:
+    ensure_runtime_dir()
+    conn = sqlite3.connect(WORKER_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_positions (
+            id TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS worker_trade_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    return conn
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def worker_meta_get(key: str, default: Any = None) -> Any:
+    with worker_db_connection() as conn:
+        row = conn.execute("SELECT value FROM worker_meta WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
+    return json.loads(row["value"])
+
+
+def worker_meta_set(key: str, value: Any) -> None:
+    now = now_ist().isoformat(timespec="seconds")
+    encoded = json.dumps(value, default=_json_default)
+    with worker_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO worker_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, encoded, now),
+        )
+        conn.commit()
+
+
+def default_worker_state() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "status": "idle",
+        "last_heartbeat": None,
+        "last_error": None,
+        "last_signal_key": None,
+        "daily_pnl": 0.0,
+        "loss_streak": 0,
+        "trade_day": str(now_ist().date()),
+        "day_start_capital": 100000.0,
+        "daily_trade_count": 0,
+        "last_action": None,
+        "last_run_at": None,
+        "mode": "PAPER",
+    }
+
+
+def load_worker_state() -> dict[str, Any]:
+    state = worker_meta_get("worker_state", default_worker_state())
+    merged = default_worker_state()
+    merged.update(state or {})
+    return merged
+
+
+def save_worker_state(state: dict[str, Any]) -> None:
+    worker_meta_set("worker_state", state)
+
+
+def load_worker_config() -> dict[str, Any]:
+    return worker_meta_get("worker_config", {})
+
+
+def save_worker_config(config: dict[str, Any]) -> None:
+    worker_meta_set("worker_config", config)
+
+
+def _position_to_payload(pos: Position, position_id: str) -> dict[str, Any]:
+    return {
+        "id": position_id,
+        "side": pos.side,
+        "entry": pos.entry,
+        "stop_loss": pos.stop_loss,
+        "target": pos.target,
+        "qty": pos.qty,
+        "opened_at": pos.opened_at.isoformat(),
+        "mode": pos.mode,
+        "reason": pos.reason,
+        "option_symbol": pos.option_symbol,
+        "security_id": pos.security_id,
+        "exchange_segment": pos.exchange_segment,
+        "order_id": pos.order_id,
+        "trailing_active": pos.trailing_active,
+        "entry_spot": pos.entry_spot,
+        "stop_loss_spot": pos.stop_loss_spot,
+        "target_spot": pos.target_spot,
+    }
+
+
+def _payload_to_position(payload: dict[str, Any]) -> Position:
+    return Position(
+        side=payload["side"],
+        entry=float(payload["entry"]),
+        stop_loss=float(payload["stop_loss"]),
+        target=float(payload["target"]),
+        qty=int(payload["qty"]),
+        opened_at=datetime.fromisoformat(payload["opened_at"]),
+        mode=payload["mode"],
+        reason=payload["reason"],
+        option_symbol=payload["option_symbol"],
+        security_id=payload.get("security_id"),
+        exchange_segment=payload.get("exchange_segment"),
+        order_id=payload.get("order_id"),
+        trailing_active=bool(payload.get("trailing_active", False)),
+        entry_spot=payload.get("entry_spot"),
+        stop_loss_spot=payload.get("stop_loss_spot"),
+        target_spot=payload.get("target_spot"),
+    )
+
+
+def load_worker_positions() -> list[dict[str, Any]]:
+    with worker_db_connection() as conn:
+        rows = conn.execute("SELECT payload FROM worker_positions ORDER BY updated_at ASC").fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+def save_worker_positions(position_payloads: list[dict[str, Any]]) -> None:
+    now = now_ist().isoformat(timespec="seconds")
+    with worker_db_connection() as conn:
+        conn.execute("DELETE FROM worker_positions")
+        for payload in position_payloads:
+            conn.execute(
+                "INSERT INTO worker_positions (id, payload, updated_at) VALUES (?, ?, ?)",
+                (payload["id"], json.dumps(payload, default=_json_default), now),
+            )
+        conn.commit()
+
+
+def append_worker_trade_log(payload: dict[str, Any]) -> None:
+    ts = str(payload.get("timestamp") or payload.get("exit_time") or now_ist().isoformat(timespec="seconds"))
+    with worker_db_connection() as conn:
+        conn.execute(
+            "INSERT INTO worker_trade_log (timestamp, payload) VALUES (?, ?)",
+            (ts, json.dumps(payload, default=_json_default)),
+        )
+        conn.commit()
+
+
+def load_worker_trade_log(limit: int = 200) -> list[dict[str, Any]]:
+    with worker_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT payload FROM worker_trade_log ORDER BY id DESC LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    return [json.loads(row["payload"]) for row in rows][::-1]
 
 
 # -----------------------------
@@ -1198,9 +1391,13 @@ def option_chain_summary(chain_response: dict, chain_df: pd.DataFrame) -> dict:
     }
 
 
-@st.cache_data(ttl=60)
-def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segment: str) -> list[str]:
-    broker = get_dhan_broker()
+def fetch_option_chain_expiries(
+    underlying_symbol: str,
+    underlying_exchange_segment: str,
+    *,
+    broker: Optional[DhanBroker] = None,
+) -> list[str]:
+    broker = broker or get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return []
@@ -1208,12 +1405,27 @@ def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segme
 
 
 @st.cache_data(ttl=60)
-def load_option_chain_payload(underlying_symbol: str, underlying_exchange_segment: str, expiry: str) -> dict:
-    broker = get_dhan_broker()
+def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segment: str) -> list[str]:
+    return fetch_option_chain_expiries(underlying_symbol, underlying_exchange_segment)
+
+
+def fetch_option_chain_payload(
+    underlying_symbol: str,
+    underlying_exchange_segment: str,
+    expiry: str,
+    *,
+    broker: Optional[DhanBroker] = None,
+) -> dict:
+    broker = broker or get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return {}
     return broker.get_option_chain(underlying_symbol, underlying_exchange_segment, expiry)
+
+
+@st.cache_data(ttl=60)
+def load_option_chain_payload(underlying_symbol: str, underlying_exchange_segment: str, expiry: str) -> dict:
+    return fetch_option_chain_payload(underlying_symbol, underlying_exchange_segment, expiry)
 
 
 def evaluate_option_chain_filter(
@@ -1360,6 +1572,67 @@ def close_position_and_record(
         "exit_time": now_ist().isoformat(timespec="seconds"),
     })
     return realized
+
+
+def apply_chain_filter_to_signal(
+    signal: Optional[Signal],
+    expiry_code: str,
+    cfg: StrategyConfig,
+    *,
+    broker: Optional[DhanBroker] = None,
+) -> tuple[Optional[Signal], Optional[ChainFilterResult], Optional[str]]:
+    if signal is None or not cfg.use_option_chain_filter:
+        return signal, None, None
+
+    option_strike = choose_strike(signal.entry, signal.side, cfg.option_moneyness, cfg.strike_step)
+    try:
+        chain_expiries = fetch_option_chain_expiries(
+            cfg.underlying_symbol,
+            cfg.underlying_exchange_segment,
+            broker=broker,
+        )
+        selected_chain_expiry = resolve_chain_expiry(expiry_code, chain_expiries)
+        if not selected_chain_expiry:
+            result = ChainFilterResult(False, "No Dhan option-chain expiry is available for this instrument.")
+            return None, result, result.reason
+
+        chain_payload = fetch_option_chain_payload(
+            cfg.underlying_symbol,
+            cfg.underlying_exchange_segment,
+            selected_chain_expiry,
+            broker=broker,
+        )
+        result = evaluate_option_chain_filter(chain_payload, signal, option_strike, cfg)
+    except Exception as exc:
+        result = ChainFilterResult(False, f"Option-chain filter failed: {exc}")
+        return None, result, result.reason
+
+    if result.passes:
+        signal.confidence = round(min(signal.confidence + cfg.option_chain_confidence_bonus, 0.99), 3)
+        signal.reason = f"{signal.reason} | {result.reason}"
+        return signal, result, None
+    return None, result, result.reason
+
+
+def build_worker_config(
+    *,
+    cfg: StrategyConfig,
+    capital: float,
+    expiry_code: str,
+    mode: TradeMode,
+    client_id: str,
+    access_token: str,
+    poll_interval_seconds: int = 60,
+) -> dict[str, Any]:
+    return {
+        "capital": capital,
+        "expiry_code": expiry_code,
+        "mode": mode,
+        "poll_interval_seconds": int(max(poll_interval_seconds, 15)),
+        "dhan_client_id": client_id,
+        "dhan_access_token": access_token,
+        "strategy": dict(cfg.__dict__),
+    }
 
 
 def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: StrategyConfig, capital: float = 100000.0) -> tuple[pd.DataFrame, dict]:
@@ -1562,15 +1835,16 @@ def risk_checks(
 # -----------------------------
 # Data fetch
 # -----------------------------
-@st.cache_data(ttl=60)
-def load_price_data(
+def fetch_price_data(
     security_id: int,
     exchange_segment: str,
     interval: str,
     period: str,
     instrument: str = "INDEX",
+    *,
+    broker: Optional[DhanBroker] = None,
 ) -> pd.DataFrame:
-    broker = get_dhan_broker()
+    broker = broker or get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return pd.DataFrame()
@@ -1614,8 +1888,18 @@ def load_price_data(
 
 
 @st.cache_data(ttl=900)
-def load_vix_data(period: str = "1y") -> pd.DataFrame:
-    broker = get_dhan_broker()
+def load_price_data(
+    security_id: int,
+    exchange_segment: str,
+    interval: str,
+    period: str,
+    instrument: str = "INDEX",
+) -> pd.DataFrame:
+    return fetch_price_data(security_id, exchange_segment, interval, period, instrument)
+
+
+def fetch_vix_data(period: str = "1y", *, broker: Optional[DhanBroker] = None) -> pd.DataFrame:
+    broker = broker or get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return pd.DataFrame()
@@ -1628,6 +1912,11 @@ def load_vix_data(period: str = "1y") -> pd.DataFrame:
         to_dt=to_dt,
     )
     return df.dropna().copy()
+
+
+@st.cache_data(ttl=900)
+def load_vix_data(period: str = "1y") -> pd.DataFrame:
+    return fetch_vix_data(period)
 
 
 @st.cache_data(ttl=3600)
@@ -1699,9 +1988,13 @@ def init_state() -> None:
         st.session_state.dhan_access_token = DhanBroker._read_secret("dhan", "access_token") or os.getenv("DHAN_ACCESS_TOKEN") or ""
 
 
-def get_dhan_broker() -> DhanBroker:
-    client_id = str(st.session_state.get("dhan_client_id", "") or "").strip() or None
-    access_token = str(st.session_state.get("dhan_access_token", "") or "").strip() or None
+def get_dhan_broker(
+    client_id: Optional[str] = None,
+    access_token: Optional[str] = None,
+) -> DhanBroker:
+    if client_id is None and access_token is None:
+        client_id = str(st.session_state.get("dhan_client_id", "") or "").strip() or None
+        access_token = str(st.session_state.get("dhan_access_token", "") or "").strip() or None
     return DhanBroker(client_id=client_id, access_token=access_token)
 
 
@@ -1709,6 +2002,7 @@ def get_dhan_broker() -> DhanBroker:
 # UI
 # -----------------------------
 def main() -> None:
+    configure_streamlit_page()
     init_state()
     ensure_login()
 
@@ -1793,6 +2087,7 @@ def main() -> None:
             f"Dhan underlying security ID: `{instrument['underlying_security_id']}`"
         )
         st.markdown(f"[Help: How to use this app]({HELP_URL})")
+        worker_poll_seconds = st.number_input("Worker poll interval (sec)", min_value=15, value=60, step=15)
         refresh = st.button("Refresh Signals", use_container_width=True)
         auto_refresh = st.checkbox("Auto-refresh every 60 sec", value=False)
 
@@ -1839,6 +2134,51 @@ def main() -> None:
         st.session_state.option_chain_payload = None
         st.session_state.option_chain_expiries = []
         st.session_state.option_chain_loaded_expiry = None
+
+    worker_config = build_worker_config(
+        cfg=cfg,
+        capital=capital,
+        expiry_code=expiry_code,
+        mode=mode,
+        client_id=str(st.session_state.get("dhan_client_id", "") or ""),
+        access_token=str(st.session_state.get("dhan_access_token", "") or ""),
+        poll_interval_seconds=int(worker_poll_seconds),
+    )
+    worker_state = load_worker_state()
+    worker_positions = load_worker_positions()
+    worker_trade_log = load_worker_trade_log(limit=50)
+
+    with st.sidebar:
+        with st.expander("Background Worker", expanded=False):
+            st.caption("Runs the signal engine outside the browser session using persistent state.")
+            st.write(f"**Status:** {worker_state.get('status', 'unknown')}")
+            st.write(f"**Last Heartbeat:** {format_ist_timestamp(worker_state.get('last_heartbeat'))}")
+            st.write(f"**Last Action:** {worker_state.get('last_action') or 'None'}")
+            if worker_state.get("last_error"):
+                st.warning(str(worker_state["last_error"]))
+            worker_button_cols = st.columns(3)
+            with worker_button_cols[0]:
+                if st.button("Save Config", use_container_width=True):
+                    save_worker_config(worker_config)
+                    st.success("Worker config saved.")
+            with worker_button_cols[1]:
+                if st.button("Enable", use_container_width=True):
+                    save_worker_config(worker_config)
+                    next_state = load_worker_state()
+                    next_state["enabled"] = True
+                    next_state["status"] = "starting"
+                    next_state["last_error"] = None
+                    save_worker_state(next_state)
+                    st.success("Worker enabled.")
+            with worker_button_cols[2]:
+                if st.button("Disable", use_container_width=True):
+                    next_state = load_worker_state()
+                    next_state["enabled"] = False
+                    next_state["status"] = "disabled"
+                    save_worker_state(next_state)
+                    st.warning("Worker disabled.")
+            st.write(f"**Open Positions:** {len(worker_positions)}")
+            st.write(f"**Worker Daily P&L:** ₹{float(worker_state.get('daily_pnl', 0.0)):,.2f}")
 
     live_tab, backtest_tab, chain_tab, notes_tab, help_tab = st.tabs(
         ["Live Signals", "Backtest", "Option Chain", "Live Wiring Notes", "Help"]
@@ -2139,6 +2479,35 @@ def main() -> None:
             st.dataframe(trade_log_df, use_container_width=True)
         else:
             st.write("No trades yet.")
+
+        st.markdown("### Background Worker")
+        worker_summary_cols = st.columns(4)
+        worker_summary_cols[0].metric("Worker Status", str(worker_state.get("status", "unknown")).upper())
+        worker_summary_cols[1].metric("Worker Open Positions", len(worker_positions))
+        worker_summary_cols[2].metric("Worker Daily P&L", f"₹{float(worker_state.get('daily_pnl', 0.0)):,.2f}")
+        worker_summary_cols[3].metric("Worker Loss Streak", str(worker_state.get("loss_streak", 0)))
+        st.caption(
+            f"Heartbeat: {format_ist_timestamp(worker_state.get('last_heartbeat')) or 'Never'} | "
+            f"Last action: {worker_state.get('last_action') or 'None'}"
+        )
+        if worker_state.get("last_error"):
+            st.warning(f"Worker error: {worker_state['last_error']}")
+        if worker_positions:
+            worker_positions_df = pd.DataFrame(worker_positions).copy()
+            for col in ("opened_at",):
+                if col in worker_positions_df.columns:
+                    worker_positions_df[col] = worker_positions_df[col].apply(format_ist_timestamp)
+            st.dataframe(worker_positions_df, use_container_width=True)
+        else:
+            st.write("Worker has no open positions.")
+        if worker_trade_log:
+            worker_trade_log_df = pd.DataFrame(worker_trade_log).copy()
+            for col in ("timestamp", "entry_time", "exit_time", "opened_at"):
+                if col in worker_trade_log_df.columns:
+                    worker_trade_log_df[col] = worker_trade_log_df[col].apply(format_ist_timestamp)
+            st.dataframe(worker_trade_log_df.tail(20), use_container_width=True)
+        else:
+            st.write("Worker trade log is empty.")
 
         st.markdown("### Recent Price Data")
         st.line_chart(price_df[["Close"]].tail(100))

@@ -1,0 +1,17 @@
+[Unit]
+Description=PowerScalper Background Worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/PowerScalper
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/ubuntu/.local/bin
+ExecStart=/usr/bin/python3 /home/ubuntu/PowerScalper/trading_worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

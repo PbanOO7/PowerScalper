@@ -170,7 +170,7 @@ def auth_credentials() -> tuple[Optional[str], Optional[str]]:
     return read_secret("auth", "username"), read_secret("auth", "password")
 
 
-def render_login_shell() -> None:
+def render_login_shell():
     st.markdown(
         """
         <style>
@@ -187,13 +187,13 @@ def render_login_shell() -> None:
             display: none;
         }
         .login-stage {
-            padding: 2.5rem 0 1rem 0;
+            padding: 1.75rem 0 0.75rem 0;
             animation: fade-slide 0.8s ease-out;
         }
         .login-brand {
-            padding: 2rem 2.2rem;
+            padding: 1.8rem 1.9rem;
             border-radius: 28px;
-            min-height: 540px;
+            min-height: 460px;
             color: #1f2937;
             background:
                 linear-gradient(160deg, rgba(255,255,255,0.72), rgba(255,248,235,0.84)),
@@ -233,10 +233,10 @@ def render_login_shell() -> None:
         }
         .login-copy {
             font-size: 1rem;
-            line-height: 1.75;
+            line-height: 1.65;
             color: #4b5563;
             max-width: 42ch;
-            margin-bottom: 1.6rem;
+            margin-bottom: 1.25rem;
         }
         .login-pill-row {
             display: flex;
@@ -254,7 +254,7 @@ def render_login_shell() -> None:
             box-shadow: 0 10px 22px rgba(148, 163, 184, 0.08);
         }
         .login-card {
-            padding: 2rem 1.8rem;
+            padding: 1.35rem 1.2rem 1rem 1.2rem;
             border-radius: 28px;
             background: rgba(255, 255, 255, 0.92);
             border: 1px solid rgba(148, 163, 184, 0.18);
@@ -264,16 +264,28 @@ def render_login_shell() -> None:
         }
         .login-card h3 {
             margin: 0 0 0.35rem 0;
-            font-size: 1.45rem;
+            font-size: 1.3rem;
             color: #111827;
         }
         .login-card p {
-            margin: 0 0 1.25rem 0;
+            margin: 0 0 0.8rem 0;
             color: #6b7280;
-            line-height: 1.6;
+            line-height: 1.45;
+        }
+        .login-form-shell {
+            margin-top: 0.2rem;
+        }
+        .login-form-shell [data-testid="stForm"] {
+            border: 0;
+            padding: 0;
+            background: transparent;
+            box-shadow: none;
+        }
+        .login-form-shell [data-testid="stTextInput"] {
+            margin-bottom: 0.2rem;
         }
         .login-footer {
-            margin-top: 1rem;
+            margin-top: 0.8rem;
             color: #6b7280;
             font-size: 0.88rem;
         }
@@ -300,7 +312,7 @@ def render_login_shell() -> None:
         unsafe_allow_html=True,
     )
     st.markdown('<div class="login-stage">', unsafe_allow_html=True)
-    left_col, right_col = st.columns([1.2, 0.9], gap="large")
+    left_col, right_col = st.columns([1.25, 0.75], gap="large")
     with left_col:
         st.markdown(
             """
@@ -330,6 +342,7 @@ def render_login_shell() -> None:
             """,
             unsafe_allow_html=True,
         )
+    return right_col
 
 
 def ensure_login() -> None:
@@ -342,30 +355,33 @@ def ensure_login() -> None:
     if st.session_state.get("authenticated"):
         return
 
-    render_login_shell()
-    with st.form("login_form", clear_on_submit=False):
-        username = st.text_input("Username", placeholder="Enter your user ID")
-        password = st.text_input("Password", type="password", placeholder="Enter your password")
-        submitted = st.form_submit_button("Login", use_container_width=True)
+    login_col = render_login_shell()
+    with login_col:
+        st.markdown('<div class="login-form-shell">', unsafe_allow_html=True)
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="Enter your user ID")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            submitted = st.form_submit_button("Login", use_container_width=True)
 
-        if submitted:
-            valid = hmac.compare_digest(username.strip(), auth_user) and hmac.compare_digest(password, auth_password)
-            if valid:
-                st.session_state.authenticated = True
-                st.session_state.auth_username = auth_user
-                st.rerun()
-            st.error("Invalid username or password.")
+            if submitted:
+                valid = hmac.compare_digest(username.strip(), auth_user) and hmac.compare_digest(password, auth_password)
+                if valid:
+                    st.session_state.authenticated = True
+                    st.session_state.auth_username = auth_user
+                    st.rerun()
+                st.error("Invalid username or password.")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown(
-        """
-            <div class="login-footer">
-                Protected deployment. Contact the administrator if you need access.
+        st.markdown(
+            """
+                <div class="login-footer">
+                    Protected deployment. Contact the administrator if you need access.
+                </div>
             </div>
-        </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
     st.stop()
 

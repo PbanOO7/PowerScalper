@@ -318,7 +318,7 @@ def render_login_shell():
             """
             <div class="login-brand">
                 <div class="login-kicker">Professional Access</div>
-                <div class="login-title">PowerScalper Control Panel</div>
+                <div class="login-title">PowerScalper Pro</div>
                 <div class="login-copy">
                     Secure access to the strategy console, backtest engine, paper execution flow,
                     and live broker controls. Use your authorized credentials to continue.

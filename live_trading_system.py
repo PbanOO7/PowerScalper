@@ -1176,7 +1176,7 @@ def option_chain_summary(chain_response: dict, chain_df: pd.DataFrame) -> dict:
 
 @st.cache_data(ttl=60)
 def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segment: str) -> list[str]:
-    broker = DhanBroker()
+    broker = get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return []
@@ -1185,7 +1185,7 @@ def load_option_chain_expiries(underlying_symbol: str, underlying_exchange_segme
 
 @st.cache_data(ttl=60)
 def load_option_chain_payload(underlying_symbol: str, underlying_exchange_segment: str, expiry: str) -> dict:
-    broker = DhanBroker()
+    broker = get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return {}
@@ -1546,7 +1546,7 @@ def load_price_data(
     period: str,
     instrument: str = "INDEX",
 ) -> pd.DataFrame:
-    broker = DhanBroker()
+    broker = get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return pd.DataFrame()
@@ -1591,7 +1591,7 @@ def load_price_data(
 
 @st.cache_data(ttl=900)
 def load_vix_data(period: str = "1y") -> pd.DataFrame:
-    broker = DhanBroker()
+    broker = get_dhan_broker()
     ready, _ = broker.status()
     if not ready:
         return pd.DataFrame()
@@ -1669,6 +1669,16 @@ def init_state() -> None:
         st.session_state.option_chain_instrument = None
     if "option_chain_loaded_expiry" not in st.session_state:
         st.session_state.option_chain_loaded_expiry = None
+    if "dhan_client_id" not in st.session_state:
+        st.session_state.dhan_client_id = DhanBroker._read_secret("dhan", "client_id") or os.getenv("DHAN_CLIENT_ID") or ""
+    if "dhan_access_token" not in st.session_state:
+        st.session_state.dhan_access_token = DhanBroker._read_secret("dhan", "access_token") or os.getenv("DHAN_ACCESS_TOKEN") or ""
+
+
+def get_dhan_broker() -> DhanBroker:
+    client_id = str(st.session_state.get("dhan_client_id", "") or "").strip() or None
+    access_token = str(st.session_state.get("dhan_access_token", "") or "").strip() or None
+    return DhanBroker(client_id=client_id, access_token=access_token)
 
 
 # -----------------------------
@@ -1688,6 +1698,35 @@ def main() -> None:
             st.session_state.authenticated = False
             st.session_state.auth_username = None
             st.rerun()
+        with st.expander("Dhan API Config", expanded=False):
+            st.text_input(
+                "Dhan Client ID",
+                key="dhan_client_id",
+                help="Stored in the current Streamlit session. Leave blank to fall back to secrets or environment variables.",
+            )
+            st.text_input(
+                "Dhan Access Token",
+                key="dhan_access_token",
+                type="password",
+                help="Stored in the current Streamlit session. Leave blank to fall back to secrets or environment variables.",
+            )
+            cred_col1, cred_col2 = st.columns(2)
+            with cred_col1:
+                if st.button("Apply Dhan Config", use_container_width=True):
+                    st.cache_data.clear()
+                    st.session_state.option_chain_payload = None
+                    st.session_state.option_chain_expiries = []
+                    st.session_state.option_chain_loaded_expiry = None
+                    st.rerun()
+            with cred_col2:
+                if st.button("Clear Dhan Config", use_container_width=True):
+                    st.session_state.dhan_client_id = ""
+                    st.session_state.dhan_access_token = ""
+                    st.cache_data.clear()
+                    st.session_state.option_chain_payload = None
+                    st.session_state.option_chain_expiries = []
+                    st.session_state.option_chain_loaded_expiry = None
+                    st.rerun()
         instrument_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), index=0)
         instrument = INSTRUMENTS[instrument_name]
         inferred_expiry = infer_nearest_weekly_expiry(expiry_weekday=instrument["expiry_weekday"])
@@ -1768,7 +1807,7 @@ def main() -> None:
     if st.session_state.day_start_capital <= 0:
         st.session_state.day_start_capital = capital
 
-    broker: BrokerInterface = PaperBroker() if mode == "PAPER" else DhanBroker()
+    broker: BrokerInterface = PaperBroker() if mode == "PAPER" else get_dhan_broker()
     live_ready, live_reason = broker.status()
 
     if st.session_state.option_chain_instrument != instrument_name:
@@ -2248,7 +2287,7 @@ def main() -> None:
 
     with chain_tab:
         st.markdown("### Dhan Option Chain")
-        chain_broker = DhanBroker()
+        chain_broker = get_dhan_broker()
         chain_ready, chain_reason = chain_broker.status()
         if chain_ready:
             st.info(f"Dhan data status: {chain_reason}")

@@ -229,7 +229,8 @@ def render_login_shell():
             font-weight: 700;
             color: #111827;
             margin-bottom: 1rem;
-            max-width: 10ch;
+            max-width: 18ch;
+            white-space: nowrap;
         }
         .login-copy {
             font-size: 1rem;
@@ -307,6 +308,13 @@ def render_login_shell():
                 transform: translateY(-14px);
             }
         }
+        @media (max-width: 900px) {
+            .login-title {
+                font-size: 2.5rem;
+                max-width: none;
+                white-space: normal;
+            }
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -318,7 +326,7 @@ def render_login_shell():
             """
             <div class="login-brand">
                 <div class="login-kicker">Professional Access</div>
-                <div class="login-title">PowerScalper Pro</div>
+                <div class="login-title">Power Scalper Pro</div>
                 <div class="login-copy">
                     Secure access to the strategy console, backtest engine, paper execution flow,
                     and live broker controls. Use your authorized credentials to continue.

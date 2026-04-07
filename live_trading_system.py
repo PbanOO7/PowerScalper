@@ -45,6 +45,7 @@ HELP_URL = "https://github.com/PbanOO7/PowerScalper#readme"
 BASE_DIR = Path(__file__).resolve().parent
 RUNTIME_DIR = BASE_DIR / "runtime"
 WORKER_DB_PATH = RUNTIME_DIR / "worker_state.db"
+UI_CONFIG_PATH = RUNTIME_DIR / "ui_config.json"
 
 INSTRUMENTS = {
     "NIFTY 50": {
@@ -498,6 +499,26 @@ class ChainFilterResult:
 
 def ensure_runtime_dir() -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_ui_config() -> dict[str, Any]:
+    ensure_runtime_dir()
+    if not UI_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(UI_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_ui_config(config: dict[str, Any]) -> None:
+    ensure_runtime_dir()
+    UI_CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+
+def clear_ui_config() -> None:
+    if UI_CONFIG_PATH.exists():
+        UI_CONFIG_PATH.unlink()
 
 
 def worker_db_connection() -> sqlite3.Connection:
@@ -1958,6 +1979,7 @@ def supported_backtest_periods(interval: str) -> list[str]:
 # Session state
 # -----------------------------
 def init_state() -> None:
+    ui_config = load_ui_config()
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     if "positions" not in st.session_state:
@@ -1983,9 +2005,19 @@ def init_state() -> None:
     if "option_chain_loaded_expiry" not in st.session_state:
         st.session_state.option_chain_loaded_expiry = None
     if "dhan_client_id" not in st.session_state:
-        st.session_state.dhan_client_id = DhanBroker._read_secret("dhan", "client_id") or os.getenv("DHAN_CLIENT_ID") or ""
+        st.session_state.dhan_client_id = (
+            str(ui_config.get("dhan_client_id", "") or "").strip()
+            or DhanBroker._read_secret("dhan", "client_id")
+            or os.getenv("DHAN_CLIENT_ID")
+            or ""
+        )
     if "dhan_access_token" not in st.session_state:
-        st.session_state.dhan_access_token = DhanBroker._read_secret("dhan", "access_token") or os.getenv("DHAN_ACCESS_TOKEN") or ""
+        st.session_state.dhan_access_token = (
+            str(ui_config.get("dhan_access_token", "") or "").strip()
+            or DhanBroker._read_secret("dhan", "access_token")
+            or os.getenv("DHAN_ACCESS_TOKEN")
+            or ""
+        )
 
 
 def get_dhan_broker(
@@ -2020,17 +2052,22 @@ def main() -> None:
             st.text_input(
                 "Dhan Client ID",
                 key="dhan_client_id",
-                help="Stored in the current Streamlit session. Leave blank to fall back to secrets or environment variables.",
+                help=f"Saved to {UI_CONFIG_PATH.name} in the runtime directory. Leave blank to fall back to secrets or environment variables.",
             )
             st.text_input(
                 "Dhan Access Token",
                 key="dhan_access_token",
                 type="password",
-                help="Stored in the current Streamlit session. Leave blank to fall back to secrets or environment variables.",
+                help=f"Saved to {UI_CONFIG_PATH.name} in the runtime directory. Leave blank to fall back to secrets or environment variables.",
             )
+            st.caption(f"Local config file: `{UI_CONFIG_PATH}`")
             cred_col1, cred_col2 = st.columns(2)
             with cred_col1:
                 if st.button("Apply Dhan Config", use_container_width=True):
+                    save_ui_config({
+                        "dhan_client_id": str(st.session_state.get("dhan_client_id", "") or "").strip(),
+                        "dhan_access_token": str(st.session_state.get("dhan_access_token", "") or "").strip(),
+                    })
                     st.cache_data.clear()
                     st.session_state.option_chain_payload = None
                     st.session_state.option_chain_expiries = []
@@ -2040,6 +2077,7 @@ def main() -> None:
                 if st.button("Clear Dhan Config", use_container_width=True):
                     st.session_state.dhan_client_id = ""
                     st.session_state.dhan_access_token = ""
+                    clear_ui_config()
                     st.cache_data.clear()
                     st.session_state.option_chain_payload = None
                     st.session_state.option_chain_expiries = []

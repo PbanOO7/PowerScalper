@@ -2015,6 +2015,44 @@ def supported_backtest_periods(interval: str) -> list[str]:
     return ["1mo", "3mo", "6mo"]
 
 
+def live_preset_defaults() -> dict[str, dict[str, Any]]:
+    return {
+        "Balanced": {
+            "confidence_threshold": 0.58,
+            "volume_spike_threshold": 1.10,
+            "use_volume_filter": True,
+            "use_bb_filter": True,
+            "use_regime_filter": True,
+            "use_option_chain_filter": True,
+            "option_chain_min_volume": 200,
+            "option_chain_max_spread_pct": 12.0,
+            "option_chain_support_ratio": 0.70,
+        },
+        "Selective": {
+            "confidence_threshold": 0.66,
+            "volume_spike_threshold": 1.20,
+            "use_volume_filter": True,
+            "use_bb_filter": True,
+            "use_regime_filter": True,
+            "use_option_chain_filter": True,
+            "option_chain_min_volume": 500,
+            "option_chain_max_spread_pct": 8.0,
+            "option_chain_support_ratio": 0.90,
+        },
+        "Aggressive": {
+            "confidence_threshold": 0.50,
+            "volume_spike_threshold": 1.00,
+            "use_volume_filter": False,
+            "use_bb_filter": False,
+            "use_regime_filter": True,
+            "use_option_chain_filter": True,
+            "option_chain_min_volume": 100,
+            "option_chain_max_spread_pct": 15.0,
+            "option_chain_support_ratio": 0.50,
+        },
+    }
+
+
 # -----------------------------
 # Session state
 # -----------------------------
@@ -2143,14 +2181,16 @@ def main() -> None:
         max_loss_streak = st.slider("Consecutive losses limit", 1, 5, 3, 1)
         max_alloc_pct = st.slider("Capital allocation cap (%)", 5.0, 100.0, 25.0, 5.0)
         max_trades = st.slider("Max trades per day", 1, 10, 3)
-        confidence = st.slider("Minimum confidence", 0.50, 0.95, 0.72, 0.01)
+        live_preset_name = st.selectbox("Live preset", ["Balanced", "Selective", "Aggressive"], index=0)
+        live_preset = live_preset_defaults()[live_preset_name]
+        confidence = st.slider("Minimum confidence", 0.45, 0.95, float(live_preset["confidence_threshold"]), 0.01)
         min_vix_trade = st.slider("VIX threshold", 10.0, 20.0, 13.0, 0.5)
         low_vix = st.slider("Low VIX regime threshold", 10.0, 18.0, 14.0, 0.5)
         high_vix = st.slider("High VIX threshold", 14.0, 25.0, 18.0, 0.5)
-        use_chain_filter = st.checkbox("Use option-chain filter", value=True)
-        chain_min_volume = st.number_input("Chain min strike volume", min_value=0, value=500, step=100)
-        chain_max_spread = st.slider("Chain max spread (%)", 1.0, 20.0, 8.0, 0.5)
-        chain_support_ratio = st.slider("Chain support ratio", 0.5, 2.0, 0.9, 0.05)
+        use_chain_filter = st.checkbox("Use option-chain filter", value=bool(live_preset["use_option_chain_filter"]))
+        chain_min_volume = st.number_input("Chain min strike volume", min_value=0, value=int(live_preset["option_chain_min_volume"]), step=100)
+        chain_max_spread = st.slider("Chain max spread (%)", 1.0, 20.0, float(live_preset["option_chain_max_spread_pct"]), 0.5)
+        chain_support_ratio = st.slider("Chain support ratio", 0.5, 2.0, float(live_preset["option_chain_support_ratio"]), 0.05)
         interval = st.selectbox("Live bar interval", ["5m", "15m", "30m"], index=0)
         period = st.selectbox("Live history period", ["5d", "10d", "1mo"], index=1)
         strike_mode = st.selectbox("Strike selection", ["ATM", "ITM1", "OTM1"], index=0)
@@ -2192,6 +2232,10 @@ def main() -> None:
         min_vix_trade_threshold=min_vix_trade,
         low_vix_threshold=low_vix,
         high_vix_threshold=high_vix,
+        volume_spike_threshold=float(live_preset["volume_spike_threshold"]),
+        use_volume_filter=bool(live_preset["use_volume_filter"]),
+        use_bb_filter=bool(live_preset["use_bb_filter"]),
+        use_regime_filter=bool(live_preset["use_regime_filter"]),
         use_option_chain_filter=use_chain_filter,
         option_chain_min_volume=int(chain_min_volume),
         option_chain_max_spread_pct=chain_max_spread,

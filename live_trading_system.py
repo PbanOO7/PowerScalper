@@ -2632,7 +2632,14 @@ def main() -> None:
             st.write("Worker trade log is empty.")
 
         st.markdown("### Recent Price Data")
-        st.line_chart(price_df[["Close"]].tail(100))
+        recent_session_df = price_df.copy()
+        if not recent_session_df.empty:
+            latest_session_date = pd.Timestamp(recent_session_df.index[-1]).date()
+            recent_session_df = recent_session_df[
+                pd.to_datetime(recent_session_df.index).date == latest_session_date
+            ]
+        st.caption("Default view: latest trading day")
+        st.line_chart(recent_session_df[["Close"]] if not recent_session_df.empty else price_df[["Close"]].tail(100))
 
         if auto_refresh:
             st.caption("Auto-refresh enabled. Reloading in 60 seconds.")

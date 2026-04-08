@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import altair as alt
 
 # ==========================================================
 # NIFTY LIVE TRADING SYSTEM
@@ -2108,6 +2109,44 @@ def get_dhan_broker(
     return DhanBroker(client_id=client_id, access_token=access_token)
 
 
+def mask_secret(value: Optional[str], keep_start: int = 4, keep_end: int = 4) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "Not set"
+    if len(raw) <= keep_start + keep_end:
+        return "*" * len(raw)
+    return f"{raw[:keep_start]}{'*' * max(len(raw) - keep_start - keep_end, 4)}{raw[-keep_end:]}"
+
+
+def current_dhan_config_snapshot() -> dict[str, str]:
+    ui_config = load_ui_config()
+    secret_client = DhanBroker._read_secret("dhan", "client_id")
+    secret_token = DhanBroker._read_secret("dhan", "access_token")
+    env_client = os.getenv("DHAN_CLIENT_ID")
+    env_token = os.getenv("DHAN_ACCESS_TOKEN")
+    session_client = str(st.session_state.get("dhan_client_id", "") or "").strip()
+    session_token = str(st.session_state.get("dhan_access_token", "") or "").strip()
+
+    if ui_config.get("dhan_client_id") or ui_config.get("dhan_access_token"):
+        source = f"UI config (`{UI_CONFIG_PATH.name}`)"
+    elif secret_client or secret_token:
+        source = "Streamlit secrets (`.streamlit/secrets.toml`)"
+    elif env_client or env_token:
+        source = "Environment variables"
+    else:
+        source = "No active source"
+
+    return {
+        "source": source,
+        "client_id": session_client or secret_client or env_client or "",
+        "access_token_masked": mask_secret(session_token or secret_token or env_token, keep_start=6, keep_end=6),
+        "ui_client_id": str(ui_config.get("dhan_client_id", "") or "").strip() or "Not set",
+        "ui_access_token_masked": mask_secret(str(ui_config.get("dhan_access_token", "") or "").strip(), keep_start=6, keep_end=6),
+        "secret_client_id": secret_client or "Not set",
+        "secret_access_token_masked": mask_secret(secret_token, keep_start=6, keep_end=6),
+    }
+
+
 # -----------------------------
 # UI
 # -----------------------------
@@ -2161,6 +2200,16 @@ def main() -> None:
                     st.session_state.option_chain_expiries = []
                     st.session_state.option_chain_loaded_expiry = None
                     st.rerun()
+            snapshot = current_dhan_config_snapshot()
+            st.markdown("#### Current Loaded Config")
+            st.write(f"**Active source:** {snapshot['source']}")
+            st.write(f"**Resolved client ID:** `{snapshot['client_id'] or 'Not set'}`")
+            st.write(f"**Resolved access token:** `{snapshot['access_token_masked']}`")
+            st.markdown("#### Stored Sources")
+            st.write(f"**UI config client ID:** `{snapshot['ui_client_id']}`")
+            st.write(f"**UI config token:** `{snapshot['ui_access_token_masked']}`")
+            st.write(f"**Secrets client ID:** `{snapshot['secret_client_id']}`")
+            st.write(f"**Secrets token:** `{snapshot['secret_access_token_masked']}`")
         instrument_name = st.selectbox("Instrument", list(INSTRUMENTS.keys()), index=0)
         instrument = INSTRUMENTS[instrument_name]
         inferred_expiry = infer_nearest_weekly_expiry(expiry_weekday=instrument["expiry_weekday"])
@@ -2639,7 +2688,28 @@ def main() -> None:
                 pd.to_datetime(recent_session_df.index).date == latest_session_date
             ]
         st.caption("Default view: latest trading day")
-        st.line_chart(recent_session_df[["Close"]] if not recent_session_df.empty else price_df[["Close"]].tail(100))
+        chart_df = (recent_session_df if not recent_session_df.empty else price_df.tail(100)).copy()
+        chart_df = chart_df.reset_index().rename(columns={"index": "Timestamp"})
+        y_min = float(chart_df["Close"].min())
+        y_max = float(chart_df["Close"].max())
+        padding = max((y_max - y_min) * 0.2, max(y_max, 1.0) * 0.001)
+        price_chart = (
+            alt.Chart(chart_df)
+            .mark_line(color="#0f766e", strokeWidth=2.5)
+            .encode(
+                x=alt.X("Timestamp:T", title="Time"),
+                y=alt.Y(
+                    "Close:Q",
+                    title="Price",
+                    scale=alt.Scale(domain=[y_min - padding, y_max + padding], zero=False),
+                ),
+                tooltip=[
+                    alt.Tooltip("Timestamp:T", title="Time"),
+                    alt.Tooltip("Close:Q", title="Close", format=",.2f"),
+                ],
+            )
+        )
+        st.altair_chart(price_chart, use_container_width=True)
 
         if auto_refresh:
             st.caption("Auto-refresh enabled. Reloading in 60 seconds.")

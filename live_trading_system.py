@@ -405,7 +405,7 @@ def ensure_login() -> None:
 
 @dataclass
 class StrategyConfig:
-    underlying_security_id: int = 26000
+    underlying_security_id: int = 13
     instrument_name: str = "NIFTY 50"
     option_prefix: str = "NIFTY"
     underlying_symbol: str = "NIFTY"
@@ -451,6 +451,45 @@ class StrategyConfig:
     backtest_cost_pct: float = 0.0010
     backtest_fixed_cost_per_order: float = 20.0
     option_price_factor_pct: float = 0.8
+
+
+def instrument_meta_for_strategy(
+    instrument_name: Optional[str] = None,
+    option_prefix: Optional[str] = None,
+    underlying_symbol: Optional[str] = None,
+) -> Optional[dict]:
+    if instrument_name and instrument_name in INSTRUMENTS:
+        return INSTRUMENTS[instrument_name]
+    for candidate in INSTRUMENTS.values():
+        if option_prefix and candidate["option_prefix"] == option_prefix:
+            return candidate
+        if underlying_symbol and candidate["underlying_symbol"] == underlying_symbol:
+            return candidate
+    return None
+
+
+def normalize_strategy_kwargs(strategy: Optional[dict[str, Any]]) -> dict[str, Any]:
+    payload = dict(strategy or {})
+    meta = instrument_meta_for_strategy(
+        instrument_name=payload.get("instrument_name"),
+        option_prefix=payload.get("option_prefix"),
+        underlying_symbol=payload.get("underlying_symbol"),
+    )
+    if not meta:
+        return payload
+
+    payload["instrument_name"] = next(
+        (name for name, instrument in INSTRUMENTS.items() if instrument is meta),
+        payload.get("instrument_name", "NIFTY 50"),
+    )
+    payload["underlying_security_id"] = meta["underlying_security_id"]
+    payload["option_prefix"] = meta["option_prefix"]
+    payload["underlying_symbol"] = meta["underlying_symbol"]
+    payload["order_exchange_segment"] = meta["order_exchange_segment"]
+    payload["underlying_exchange_segment"] = meta["underlying_exchange_segment"]
+    payload["lot_size"] = meta["lot_size"]
+    payload["strike_step"] = meta["strike_step"]
+    return payload
 
 
 @dataclass
@@ -1645,6 +1684,7 @@ def build_worker_config(
     access_token: str,
     poll_interval_seconds: int = 60,
 ) -> dict[str, Any]:
+    strategy_payload = normalize_strategy_kwargs(dict(cfg.__dict__))
     return {
         "capital": capital,
         "expiry_code": expiry_code,
@@ -1652,7 +1692,7 @@ def build_worker_config(
         "poll_interval_seconds": int(max(poll_interval_seconds, 15)),
         "dhan_client_id": client_id,
         "dhan_access_token": access_token,
-        "strategy": dict(cfg.__dict__),
+        "strategy": strategy_payload,
     }
 
 

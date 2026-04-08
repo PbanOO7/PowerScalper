@@ -23,9 +23,11 @@ from live_trading_system import (
     load_worker_state,
     loss_limit_breached,
     make_option_symbol,
+    normalize_strategy_kwargs,
     now_ist,
     option_price_bounds,
     risk_checks,
+    save_worker_config,
     save_worker_positions,
     save_worker_state,
 )
@@ -93,7 +95,11 @@ def run_worker_cycle() -> int:
     expiry_code = str(config.get("expiry_code", ""))
     mode = config.get("mode", "PAPER")
     poll_interval_seconds = int(config.get("poll_interval_seconds", 60))
-    cfg = StrategyConfig(**config.get("strategy", {}))
+    normalized_strategy = normalize_strategy_kwargs(config.get("strategy", {}))
+    if normalized_strategy != config.get("strategy", {}):
+        config["strategy"] = normalized_strategy
+        save_worker_config(config)
+    cfg = StrategyConfig(**normalized_strategy)
     state["mode"] = mode
 
     if state.get("trade_day") != str(now_ist().date()):

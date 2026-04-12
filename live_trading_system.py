@@ -2978,18 +2978,20 @@ def main() -> None:
 
         preset_defaults = {
             "Balanced": {
-                "confidence_threshold": 0.50,
+                "confidence_threshold": 0.45,
                 "volume_spike_threshold": 1.00,
                 "use_volume_filter": True,
                 "use_bb_filter": False,
                 "use_regime_filter": True,
+                "min_vix_trade_threshold": 12.0,
             },
             "Aggressive": {
-                "confidence_threshold": 0.45,
-                "volume_spike_threshold": 1.00,
+                "confidence_threshold": 0.38,
+                "volume_spike_threshold": 0.90,
                 "use_volume_filter": False,
                 "use_bb_filter": False,
                 "use_regime_filter": False,
+                "min_vix_trade_threshold": 11.0,
             },
             "Strict": {
                 "confidence_threshold": cfg.confidence_threshold,
@@ -2997,6 +2999,7 @@ def main() -> None:
                 "use_volume_filter": cfg.use_volume_filter,
                 "use_bb_filter": cfg.use_bb_filter,
                 "use_regime_filter": cfg.use_regime_filter,
+                "min_vix_trade_threshold": cfg.min_vix_trade_threshold,
             },
         }
         preset = preset_defaults[bt_preset]
@@ -3004,7 +3007,7 @@ def main() -> None:
         with st.expander("Backtest tuning", expanded=True):
             bt_confidence = st.slider(
                 "Backtest confidence threshold",
-                0.40,
+                0.30,
                 0.90,
                 float(preset["confidence_threshold"]),
                 0.01,
@@ -3012,7 +3015,7 @@ def main() -> None:
             )
             bt_volume_spike = st.slider(
                 "Backtest volume spike threshold",
-                1.00,
+                0.80,
                 2.00,
                 float(preset["volume_spike_threshold"]),
                 0.05,
@@ -3032,6 +3035,14 @@ def main() -> None:
                 "Use regime filter",
                 value=bool(preset["use_regime_filter"]),
                 key=f"bt_use_regime_{bt_preset}",
+            )
+            bt_min_vix_trade = st.slider(
+                "Backtest VIX threshold",
+                10.0,
+                20.0,
+                float(preset["min_vix_trade_threshold"]),
+                0.5,
+                key=f"bt_min_vix_{bt_preset}",
             )
             bt_slippage_bps = st.slider(
                 "Slippage per side (bps)",
@@ -3081,6 +3092,7 @@ def main() -> None:
                     "use_volume_filter": bt_use_volume,
                     "use_bb_filter": bt_use_bb,
                     "use_regime_filter": bt_use_regime,
+                    "min_vix_trade_threshold": bt_min_vix_trade,
                     "backtest_slippage_pct": bt_slippage_bps / 10000,
                     "backtest_cost_pct": bt_cost_bps / 10000,
                     "backtest_fixed_cost_per_order": bt_fixed_cost,
@@ -3095,7 +3107,7 @@ def main() -> None:
                 st.caption(
                     f"Running {bt_preset.lower()} backtest with confidence >= {bt_confidence:.2f}, "
                     f"volume spike >= {bt_volume_spike:.2f}, volume filter={bt_use_volume}, "
-                    f"BB filter={bt_use_bb}, regime filter={bt_use_regime}, "
+                    f"BB filter={bt_use_bb}, regime filter={bt_use_regime}, VIX >= {bt_min_vix_trade:.1f}, "
                     f"slippage={bt_slippage_bps:.0f} bps/side, variable costs={bt_cost_bps:.0f} bps, "
                     f"fixed cost=₹{bt_fixed_cost:.0f}/order."
                 )

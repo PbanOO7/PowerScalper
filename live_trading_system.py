@@ -2125,18 +2125,25 @@ def fetch_price_data(
     ) if instrument == "INDEX" else [int(security_id)]
 
     df = pd.DataFrame()
+    last_error: Optional[Exception] = None
     for candidate_id in candidates:
-        df = broker.get_historical_data(
-            candidate_id,
-            exchange_segment,
-            instrument,
-            interval=fetch_interval,
-            from_dt=from_dt,
-            to_dt=to_dt,
-        )
+        try:
+            df = broker.get_historical_data(
+                candidate_id,
+                exchange_segment,
+                instrument,
+                interval=fetch_interval,
+                from_dt=from_dt,
+                to_dt=to_dt,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
         if not df.empty:
             break
     if df.empty:
+        if last_error is not None:
+            raise last_error
         return df
     df = normalize_intraday_data(df)
     if requested_interval == "30m":

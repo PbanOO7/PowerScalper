@@ -1693,6 +1693,25 @@ def calculate_position_size(
     return lots * lot_size
 
 
+def quantity_too_small_reason(
+    capital: float,
+    signal: Signal,
+    cfg: StrategyConfig,
+    *,
+    premium_per_unit: Optional[float] = None,
+) -> str:
+    premium = max(premium_per_unit if premium_per_unit is not None else signal.option_entry, 1.0)
+    per_unit_risk = max(abs(signal.option_entry - signal.option_stop_loss), 0.5)
+    lot_cost = premium * cfg.lot_size
+    lot_risk = per_unit_risk * cfg.lot_size
+    alloc_budget = capital * max(cfg.max_capital_allocation_pct, 0.0) / 100
+    risk_budget = capital * max(min(cfg.risk_per_trade_pct, 2.0), 1.0) / 100
+    return (
+        f"One lot needs about ₹{lot_cost:,.0f} premium and ₹{lot_risk:,.0f} risk, "
+        f"but allocation budget is ₹{alloc_budget:,.0f} and risk budget is ₹{risk_budget:,.0f}."
+    )
+
+
 def reset_daily_state_if_needed(capital: float) -> None:
     current_day = str(now_ist().date())
     if st.session_state.trade_day != current_day:
@@ -1927,7 +1946,12 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
                 sig.option_entry,
             )
             if qty <= 0:
-                debug_rows.append({"timestamp": now, "status": "rejected", "code": "quantity_too_small", "reason": "Capital allocation cap is too small to fund one lot."})
+                debug_rows.append({
+                    "timestamp": now,
+                    "status": "rejected",
+                    "code": "quantity_too_small",
+                    "reason": quantity_too_small_reason(current_capital, sig, cfg, premium_per_unit=sig.option_entry),
+                })
                 continue
 
             open_trade = {
@@ -2034,7 +2058,7 @@ def risk_rejection(
     kill_switch_active: bool = False,
 ) -> Optional[dict[str, str]]:
     if qty <= 0:
-        return rejection("quantity_too_small", "Capital allocation cap is too small to fund one lot.")
+        return rejection("quantity_too_small", quantity_too_small_reason(day_start_capital, signal, cfg))
     if last_signal_key and signal_key == last_signal_key:
         return rejection("duplicate_signal", "This signal has already been acted on.")
     if kill_switch_active:

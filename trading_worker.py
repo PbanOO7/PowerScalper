@@ -12,8 +12,8 @@ from live_trading_system import (
     StrategyConfig,
     apply_chain_filter_to_signal,
     append_worker_trade_log,
-    build_signal,
     calculate_position_size,
+    evaluate_signal,
     estimated_option_price,
     fetch_price_data,
     fetch_vix_data,
@@ -27,6 +27,7 @@ from live_trading_system import (
     now_ist,
     option_price_bounds,
     risk_checks,
+    risk_rejection,
     save_worker_config,
     save_worker_positions,
     save_worker_state,
@@ -217,17 +218,22 @@ def run_worker_cycle() -> int:
             "exit_reason": exit_reason,
             "realized_pnl": realized,
             "entry_spot": pos.entry_spot,
+            "entry_time": pos.opened_at.isoformat(),
         })
 
     save_worker_positions(updated_positions)
 
-    signal = build_signal(price_df, vix_now, vix_prev, cfg)
-    signal, _, no_trade_reason = apply_chain_filter_to_signal(
+    signal_eval = evaluate_signal(price_df, vix_now, vix_prev, cfg)
+    signal = signal_eval.signal
+    rejections = list(signal_eval.rejections)
+    signal, _, chain_rejection = apply_chain_filter_to_signal(
         signal,
         expiry_code,
         cfg,
         broker=broker if isinstance(broker, DhanBroker) else None,
     )
+    if chain_rejection:
+        rejections.append(chain_rejection)
 
     trades_today = int(state.get("daily_trade_count", 0))
     if signal is not None:
@@ -249,6 +255,19 @@ def run_worker_cycle() -> int:
             signal.option_entry,
         )
         signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
+        risk_reject = risk_rejection(
+            signal,
+            float(state.get("day_start_capital", capital)),
+            float(state.get("daily_pnl", 0.0)),
+            trades_today,
+            int(state.get("loss_streak", 0)),
+            qty,
+            signal_key,
+            state.get("last_signal_key"),
+            cfg,
+        )
+        if risk_reject:
+            rejections.append(risk_reject)
         if (
             ok
             and qty > 0
@@ -309,9 +328,27 @@ def run_worker_cycle() -> int:
                 state["daily_trade_count"] = trades_today + 1
                 state["last_action"] = f"Entered {option_symbol} x {qty}"
         else:
-            state["last_action"] = f"No entry: {reason if signal is not None else no_trade_reason or 'No signal'}"
+            final_reason = rejections[-1]["reason"] if rejections else reason
+            append_worker_trade_log({
+                "timestamp": now_ist().isoformat(timespec="seconds"),
+                "event": "rejection",
+                "reason": final_reason,
+                "reason_code": rejections[-1]["code"] if rejections else "risk_check_failed",
+                "candidate_side": signal.side,
+                "candidate_confidence": signal.confidence,
+            })
+            state["last_action"] = f"No entry: {final_reason}"
     else:
-        state["last_action"] = no_trade_reason or "No signal"
+        final_reason = rejections[0]["reason"] if rejections else "No signal"
+        append_worker_trade_log({
+            "timestamp": now_ist().isoformat(timespec="seconds"),
+            "event": "rejection",
+            "reason": final_reason,
+            "reason_code": rejections[0]["code"] if rejections else "no_signal",
+            "candidate_side": signal_eval.candidate_side,
+            "candidate_confidence": signal_eval.candidate_confidence,
+        })
+        state["last_action"] = final_reason
 
     state["status"] = "active"
     state["last_error"] = None

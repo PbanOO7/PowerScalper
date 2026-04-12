@@ -428,7 +428,7 @@ class StrategyConfig:
     max_rr: float = 2.0
     stop_loss_pct: float = 0.6
     target_pct: float = 1.2
-    max_holding_minutes: int = 30
+    max_holding_minutes: int = 10
     max_daily_loss_pct: float = 5.0
     risk_per_trade_pct: float = 1.0
     max_capital_allocation_pct: float = 25.0
@@ -448,6 +448,7 @@ class StrategyConfig:
     option_chain_max_spread_pct: float = 8.0
     option_chain_support_ratio: float = 0.9
     option_chain_confidence_bonus: float = 0.03
+    option_chain_soft_support: bool = False
     backtest_slippage_pct: float = 0.0015
     backtest_cost_pct: float = 0.0010
     backtest_fixed_cost_per_order: float = 20.0
@@ -535,6 +536,23 @@ class ChainFilterResult:
     spread_pct: float = 0.0
     option_volume: float = 0.0
     support_ratio: float = 0.0
+    blocks_entry: bool = True
+
+
+@dataclass
+class SignalDiagnostics:
+    signal: Optional[Signal]
+    rejections: list[dict[str, str]]
+    bullish_score: float
+    bearish_score: float
+    bullish_reasons: list[str]
+    bearish_reasons: list[str]
+    candidate_side: Optional[SignalSide] = None
+    candidate_confidence: float = 0.0
+
+
+def rejection(code: str, reason: str) -> dict[str, str]:
+    return {"code": code, "reason": reason}
 
 
 def ensure_runtime_dir() -> None:
@@ -1231,11 +1249,29 @@ def resolve_chain_expiry(expiry_code: str, expiries: list[str]) -> Optional[str]
 # -----------------------------
 # Signal engine
 # -----------------------------
-def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cfg: StrategyConfig) -> Optional[Signal]:
-    if df.empty or len(df) < max(cfg.slow_ema + 5, cfg.bb_period + 5):
-        return None
+def evaluate_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cfg: StrategyConfig) -> SignalDiagnostics:
+    rejections: list[dict[str, str]] = []
+    min_rows = max(cfg.slow_ema + 5, cfg.bb_period + 5)
+    if df.empty:
+        return SignalDiagnostics(None, [rejection("data_unavailable", "No price data is available for signal evaluation.")], 0.0, 0.0, [], [])
+    if len(df) < min_rows:
+        return SignalDiagnostics(
+            None,
+            [rejection("insufficient_history", f"Need at least {min_rows} bars; only {len(df)} available.")],
+            0.0,
+            0.0,
+            [],
+            [],
+        )
     if vix_now < cfg.min_vix_trade_threshold:
-        return None
+        return SignalDiagnostics(
+            None,
+            [rejection("below_vix_threshold", f"India VIX {vix_now:.2f} is below the trade threshold of {cfg.min_vix_trade_threshold:.2f}.")],
+            0.0,
+            0.0,
+            [],
+            [],
+        )
 
     x = enrich_price_data(df, cfg)
     row = x.iloc[-1]
@@ -1257,8 +1293,8 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
 
     bullish_score = 0.0
     bearish_score = 0.0
-    bullish_reasons = []
-    bearish_reasons = []
+    bullish_reasons: list[str] = []
+    bearish_reasons: list[str] = []
 
     if trend_up:
         bullish_score += 0.22
@@ -1280,13 +1316,16 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
         bearish_score += 0.10
         bearish_reasons.append("Shooting star reversal")
 
-    if cfg.use_volume_filter and volume_ok:
-        bullish_score += 0.14 if trend_up else 0.0
-        bearish_score += 0.14 if trend_down else 0.0
-        if trend_up:
-            bullish_reasons.append("Volume spike")
-        if trend_down:
-            bearish_reasons.append("Volume spike")
+    if cfg.use_volume_filter:
+        if volume_ok:
+            bullish_score += 0.14 if trend_up else 0.0
+            bearish_score += 0.14 if trend_down else 0.0
+            if trend_up:
+                bullish_reasons.append("Volume spike")
+            if trend_down:
+                bearish_reasons.append("Volume spike")
+        else:
+            rejections.append(rejection("volume_filter", f"Volume ratio {float(row['vol_ratio']):.2f} is below {cfg.volume_spike_threshold:.2f}."))
 
     if breakout_up:
         bullish_score += 0.12
@@ -1302,12 +1341,17 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
         bearish_score += 0.10
         bearish_reasons.append("RSI bearish")
 
-    if cfg.use_bb_filter and bb_expand_up:
-        bullish_score += 0.08
-        bullish_reasons.append("BB expansion up")
-    if cfg.use_bb_filter and bb_expand_down:
-        bearish_score += 0.08
-        bearish_reasons.append("BB expansion down")
+    if cfg.use_bb_filter:
+        if bb_expand_up:
+            bullish_score += 0.08
+            bullish_reasons.append("BB expansion up")
+        elif trend_up:
+            rejections.append(rejection("bb_filter_up", "Bullish setup did not confirm with Bollinger expansion."))
+        if bb_expand_down:
+            bearish_score += 0.08
+            bearish_reasons.append("BB expansion down")
+        elif trend_down:
+            rejections.append(rejection("bb_filter_down", "Bearish setup did not confirm with Bollinger expansion."))
 
     if reject_vwap_for_call and regime in ("TRENDING", "RANGE"):
         bullish_score += 0.08
@@ -1326,44 +1370,48 @@ def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cf
 
     spot = float(row["Close"])
     ts = row.name.to_pydatetime() if hasattr(row.name, "to_pydatetime") else now_ist()
-    option_entry = estimated_option_price(spot, spot, "CE", cfg)
+    candidate_side: Optional[SignalSide] = None
+    candidate_score = max(bullish_score, bearish_score)
+    if bullish_score > bearish_score:
+        candidate_side = "CE"
+    elif bearish_score > bullish_score:
+        candidate_side = "PE"
+
+    if candidate_side is None:
+        rejections.append(rejection("no_directional_edge", "Bullish and bearish scores are tied; no directional edge."))
+        return SignalDiagnostics(None, rejections, bullish_score, bearish_score, bullish_reasons, bearish_reasons, None, 0.0)
+
+    if candidate_score < cfg.confidence_threshold:
+        rejections.append(
+            rejection(
+                "confidence_below_threshold",
+                f"{candidate_side} confidence {candidate_score:.2f} is below the threshold of {cfg.confidence_threshold:.2f}.",
+            )
+        )
+        return SignalDiagnostics(None, rejections, bullish_score, bearish_score, bullish_reasons, bearish_reasons, candidate_side, candidate_score)
+
+    option_entry = estimated_option_price(spot, spot, candidate_side, cfg)
     option_stop, option_target = premium_stop_target(option_entry, cfg)
+    reasons = bullish_reasons if candidate_side == "CE" else bearish_reasons
+    reasons.append(f"Premium SL {cfg.stop_loss_pct:.1f}% / target {cfg.target_pct:.1f}%")
+    signal = Signal(
+        ts,
+        candidate_side,
+        spot,
+        float(row["Low"]) if candidate_side == "CE" else float(row["High"]),
+        float(row["High"]) if candidate_side == "CE" else float(row["Low"]),
+        regime,
+        round(min(candidate_score, 0.99), 3),
+        " | ".join(reasons),
+        option_entry,
+        option_stop,
+        option_target,
+    )
+    return SignalDiagnostics(signal, rejections, bullish_score, bearish_score, bullish_reasons, bearish_reasons, candidate_side, candidate_score)
 
-    if bullish_score >= cfg.confidence_threshold and bullish_score > bearish_score:
-        bullish_reasons.append(f"Premium SL {cfg.stop_loss_pct:.1f}% / target {cfg.target_pct:.1f}%")
-        return Signal(
-            ts,
-            "CE",
-            spot,
-            float(row["Low"]),
-            float(row["High"]),
-            regime,
-            round(min(bullish_score, 0.99), 3),
-            " | ".join(bullish_reasons),
-            option_entry,
-            option_stop,
-            option_target,
-        )
 
-    if bearish_score >= cfg.confidence_threshold and bearish_score > bullish_score:
-        option_entry = estimated_option_price(spot, spot, "PE", cfg)
-        option_stop, option_target = premium_stop_target(option_entry, cfg)
-        bearish_reasons.append(f"Premium SL {cfg.stop_loss_pct:.1f}% / target {cfg.target_pct:.1f}%")
-        return Signal(
-            ts,
-            "PE",
-            spot,
-            float(row["High"]),
-            float(row["Low"]),
-            regime,
-            round(min(bearish_score, 0.99), 3),
-            " | ".join(bearish_reasons),
-            option_entry,
-            option_stop,
-            option_target,
-        )
-
-    return None
+def build_signal(df: pd.DataFrame, vix_now: float, vix_prev: Optional[float], cfg: StrategyConfig) -> Optional[Signal]:
+    return evaluate_signal(df, vix_now, vix_prev, cfg).signal
 
 
 # -----------------------------
@@ -1531,6 +1579,15 @@ def evaluate_option_chain_filter(
             support_ratio=support_ratio,
         )
     if support_ratio < cfg.option_chain_support_ratio:
+        if cfg.option_chain_soft_support:
+            return ChainFilterResult(
+                True,
+                f"Chain warning: OI support {support_ratio:.2f}x is below {cfg.option_chain_support_ratio:.2f}x.",
+                spread_pct=spread_pct,
+                option_volume=volume,
+                support_ratio=support_ratio,
+                blocks_entry=False,
+            )
         return ChainFilterResult(
             False,
             f"Option chain rejected {signal.side}: opposing OI support {support_ratio:.2f}x is below {cfg.option_chain_support_ratio:.2f}x.",
@@ -1545,6 +1602,7 @@ def evaluate_option_chain_filter(
         spread_pct=spread_pct,
         option_volume=volume,
         support_ratio=support_ratio,
+        blocks_entry=False,
     )
 
 
@@ -1641,7 +1699,7 @@ def apply_chain_filter_to_signal(
     cfg: StrategyConfig,
     *,
     broker: Optional[DhanBroker] = None,
-) -> tuple[Optional[Signal], Optional[ChainFilterResult], Optional[str]]:
+) -> tuple[Optional[Signal], Optional[ChainFilterResult], Optional[dict[str, str]]]:
     if signal is None or not cfg.use_option_chain_filter:
         return signal, None, None
 
@@ -1655,7 +1713,7 @@ def apply_chain_filter_to_signal(
         selected_chain_expiry = resolve_chain_expiry(expiry_code, chain_expiries)
         if not selected_chain_expiry:
             result = ChainFilterResult(False, "No Dhan option-chain expiry is available for this instrument.")
-            return None, result, result.reason
+            return None, result, rejection("option_chain_expiry_unavailable", result.reason)
 
         chain_payload = fetch_option_chain_payload(
             cfg.underlying_symbol,
@@ -1666,13 +1724,13 @@ def apply_chain_filter_to_signal(
         result = evaluate_option_chain_filter(chain_payload, signal, option_strike, cfg)
     except Exception as exc:
         result = ChainFilterResult(False, f"Option-chain filter failed: {exc}")
-        return None, result, result.reason
+        return None, result, rejection("option_chain_failure", result.reason)
 
     if result.passes:
         signal.confidence = round(min(signal.confidence + cfg.option_chain_confidence_bonus, 0.99), 3)
         signal.reason = f"{signal.reason} | {result.reason}"
         return signal, result, None
-    return None, result, result.reason
+    return None, result, rejection("option_chain_rejection", result.reason)
 
 
 def build_worker_config(
@@ -1704,6 +1762,7 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
     vix_map = derive_daily_vix_map(vix_df)
     x = enrich_price_data(price_df, cfg)
     trades = []
+    debug_rows = []
     open_trade = None
     current_capital = capital
     peak_capital = capital
@@ -1806,11 +1865,15 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
             if loss_limit_breached(day_start_capital[day], daily_pnl[day], cfg):
                 continue
             if daily_loss_streak[day] >= cfg.max_consecutive_losses:
+                debug_rows.append({"timestamp": now, "status": "rejected", "code": "consecutive_loss_limit", "reason": "Consecutive loss kill switch active"})
                 continue
 
             sub_df = x.iloc[: i + 1][["Open", "High", "Low", "Close", "Volume"]].copy()
-            sig = build_signal(sub_df, vix_now, vix_prev, cfg)
+            signal_eval = evaluate_signal(sub_df, vix_now, vix_prev, cfg)
+            sig = signal_eval.signal
             if sig is None:
+                for item in signal_eval.rejections or [rejection("no_signal", "No qualifying directional setup.")]:
+                    debug_rows.append({"timestamp": now, "status": "rejected", "code": item["code"], "reason": item["reason"]})
                 continue
 
             qty = calculate_position_size(
@@ -1823,6 +1886,7 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
                 sig.option_entry,
             )
             if qty <= 0:
+                debug_rows.append({"timestamp": now, "status": "rejected", "code": "quantity_too_small", "reason": "Capital allocation cap is too small to fund one lot."})
                 continue
 
             open_trade = {
@@ -1837,8 +1901,17 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
                 "entry_spot": sig.entry,
             }
             daily_trade_counts[day] += 1
+            debug_rows.append({
+                "timestamp": now,
+                "status": "signal",
+                "code": "entry_candidate",
+                "reason": sig.reason,
+                "side": sig.side,
+                "confidence": sig.confidence,
+            })
 
     trades_df = pd.DataFrame(trades)
+    debug_df = pd.DataFrame(debug_rows)
     if trades_df.empty:
         return trades_df, {
             "total_trades": 0,
@@ -1849,6 +1922,12 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
             "return_pct": 0.0,
             "max_drawdown_pct": 0.0,
             "profit_factor": 0.0,
+            "signal_count": int(len(debug_df[debug_df.get("status") == "signal"])) if not debug_df.empty else 0,
+            "executed_trade_count": 0,
+            "avg_hold_minutes": 0.0,
+            "avg_trades_per_day": 0.0,
+            "rejection_counts": {} if debug_df.empty else debug_df[debug_df["status"] == "rejected"]["code"].value_counts().to_dict(),
+            "debug_df": debug_df,
         }
 
     wins = trades_df[trades_df["net_pnl"] > 0]
@@ -1864,6 +1943,12 @@ def backtest_strategy(price_df: pd.DataFrame, vix_df: pd.DataFrame, cfg: Strateg
         "return_pct": float((current_capital - capital) / capital),
         "max_drawdown_pct": float(max_drawdown),
         "profit_factor": float(gross_profit / gross_loss) if gross_loss > 0 else float("inf"),
+        "signal_count": int(len(debug_df[debug_df["status"] == "signal"])) if not debug_df.empty else int(len(trades_df)),
+        "executed_trade_count": int(len(trades_df)),
+        "avg_hold_minutes": float(((trades_df["exit_time"] - trades_df["entry_time"]).dt.total_seconds() / 60).mean()) if not trades_df.empty else 0.0,
+        "avg_trades_per_day": float(len(trades_df) / max(len(trades_df["entry_time"].dt.date.unique()), 1)) if not trades_df.empty else 0.0,
+        "rejection_counts": {} if debug_df.empty else debug_df[debug_df["status"] == "rejected"]["code"].value_counts().to_dict(),
+        "debug_df": debug_df,
     }
     return trades_df, stats
 
@@ -1892,6 +1977,76 @@ def risk_checks(
     if abs(signal.option_entry - signal.option_stop_loss) < 0.5:
         return False, "Stop distance too tight"
     return True, "OK"
+
+
+def risk_rejection(
+    signal: Signal,
+    day_start_capital: float,
+    daily_realized_pnl: float,
+    trades_today: int,
+    loss_streak: int,
+    qty: int,
+    signal_key: str,
+    last_signal_key: Optional[str],
+    cfg: StrategyConfig,
+    *,
+    kill_switch_active: bool = False,
+) -> Optional[dict[str, str]]:
+    if qty <= 0:
+        return rejection("quantity_too_small", "Capital allocation cap is too small to fund one lot.")
+    if last_signal_key and signal_key == last_signal_key:
+        return rejection("duplicate_signal", "This signal has already been acted on.")
+    if kill_switch_active:
+        return rejection("daily_kill_switch", "Daily kill switch is active for the current session.")
+    ok, reason = risk_checks(signal, day_start_capital, daily_realized_pnl, trades_today, loss_streak, cfg)
+    if ok:
+        return None
+    mapping = {
+        "Max trades reached": "max_trades_reached",
+        "Daily loss limit breached": "daily_loss_limit",
+        "Consecutive loss kill switch active": "consecutive_loss_limit",
+        "Signal confidence below threshold": "confidence_below_threshold",
+        "Stop distance too tight": "stop_distance_too_tight",
+    }
+    return rejection(mapping.get(reason, "risk_check_failed"), reason)
+
+
+def summarize_rejections(rejections: list[dict[str, str]]) -> pd.DataFrame:
+    if not rejections:
+        return pd.DataFrame(columns=["code", "reason"])
+    return pd.DataFrame(rejections)
+
+
+def worker_validation_summary(worker_trade_log: list[dict[str, Any]]) -> dict[str, float]:
+    if not worker_trade_log:
+        return {
+            "entries_today": 0,
+            "rejections_today": 0,
+            "win_rate": 0.0,
+            "avg_realized_pnl": 0.0,
+            "avg_hold_minutes": 0.0,
+        }
+    today = str(now_ist().date())
+    today_rows = [row for row in worker_trade_log if today in str(row.get("timestamp", ""))]
+    entries = [row for row in today_rows if row.get("event") == "entry_attempt" and row.get("status") in {"paper_filled", "filled", "success", "accepted"}]
+    exits = [row for row in today_rows if row.get("event") == "exit"]
+    rejections = [row for row in today_rows if row.get("event") == "rejection"]
+    hold_minutes = []
+    for row in exits:
+        entry_time = row.get("entry_time")
+        exit_time = row.get("timestamp") or row.get("exit_time")
+        if entry_time and exit_time:
+            try:
+                hold_minutes.append((datetime.fromisoformat(exit_time) - datetime.fromisoformat(entry_time)).total_seconds() / 60)
+            except Exception:
+                pass
+    return {
+        "entries_today": float(len(entries)),
+        "rejections_today": float(len(rejections)),
+        "win_rate": float(sum(1 for row in exits if float(row.get("realized_pnl", 0.0)) > 0) / len(exits)) if exits else 0.0,
+        "avg_realized_pnl": float(sum(float(row.get("realized_pnl", 0.0)) for row in exits) / len(exits)) if exits else 0.0,
+        "avg_hold_minutes": float(sum(hold_minutes) / len(hold_minutes)) if hold_minutes else 0.0,
+    }
 
 
 # -----------------------------
@@ -2018,6 +2173,18 @@ def supported_backtest_periods(interval: str) -> list[str]:
 
 def live_preset_defaults() -> dict[str, dict[str, Any]]:
     return {
+        "Selective NIFTY Scalp": {
+            "confidence_threshold": 0.52,
+            "volume_spike_threshold": 1.00,
+            "use_volume_filter": True,
+            "use_bb_filter": False,
+            "use_regime_filter": True,
+            "use_option_chain_filter": True,
+            "option_chain_min_volume": 100,
+            "option_chain_max_spread_pct": 12.0,
+            "option_chain_support_ratio": 0.70,
+            "option_chain_soft_support": True,
+        },
         "Balanced": {
             "confidence_threshold": 0.50,
             "volume_spike_threshold": 1.00,
@@ -2028,6 +2195,7 @@ def live_preset_defaults() -> dict[str, dict[str, Any]]:
             "option_chain_min_volume": 100,
             "option_chain_max_spread_pct": 15.0,
             "option_chain_support_ratio": 0.50,
+            "option_chain_soft_support": True,
         },
         "Selective": {
             "confidence_threshold": 0.60,
@@ -2039,6 +2207,7 @@ def live_preset_defaults() -> dict[str, dict[str, Any]]:
             "option_chain_min_volume": 250,
             "option_chain_max_spread_pct": 10.0,
             "option_chain_support_ratio": 0.70,
+            "option_chain_soft_support": False,
         },
         "Aggressive": {
             "confidence_threshold": 0.45,
@@ -2050,6 +2219,7 @@ def live_preset_defaults() -> dict[str, dict[str, Any]]:
             "option_chain_min_volume": 0,
             "option_chain_max_spread_pct": 20.0,
             "option_chain_support_ratio": 0.50,
+            "option_chain_soft_support": False,
         },
     }
 
@@ -2225,12 +2395,12 @@ def main() -> None:
         sl_pct = st.slider("SL (%)", 20.0, 30.0, 25.0, 1.0)
         target_pct = st.slider("Target (%)", 40.0, 60.0, 50.0, 1.0)
         risk_pct = st.slider("Risk per trade (%)", 1.0, 2.0, 1.0, 0.25)
-        max_hold_mins = st.slider("Max holding time (min)", 5, 180, 30, 5)
+        max_hold_mins = st.slider("Max holding time (min)", 5, 180, 10, 5)
         daily_loss_limit = st.slider("Daily loss limit (%)", 1.0, 10.0, 5.0, 0.5)
         max_loss_streak = st.slider("Consecutive losses limit", 1, 5, 3, 1)
         max_alloc_pct = st.slider("Capital allocation cap (%)", 5.0, 100.0, 25.0, 5.0)
         max_trades = st.slider("Max trades per day", 1, 10, 3)
-        live_preset_name = st.selectbox("Live preset", ["Balanced", "Selective", "Aggressive"], index=0)
+        live_preset_name = st.selectbox("Live preset", ["Selective NIFTY Scalp", "Balanced", "Selective", "Aggressive"], index=0)
         live_preset = live_preset_defaults()[live_preset_name]
         confidence = st.slider("Minimum confidence", 0.45, 0.95, float(live_preset["confidence_threshold"]), 0.01)
         min_vix_trade = st.slider("VIX threshold", 10.0, 20.0, 13.0, 0.5)
@@ -2289,6 +2459,7 @@ def main() -> None:
         option_chain_min_volume=int(chain_min_volume),
         option_chain_max_spread_pct=chain_max_spread,
         option_chain_support_ratio=chain_support_ratio,
+        option_chain_soft_support=bool(live_preset["option_chain_soft_support"]),
         allow_live_orders=(mode == "LIVE" and live_confirmed),
         option_moneyness=strike_mode,
     )
@@ -2318,6 +2489,7 @@ def main() -> None:
     worker_state = load_worker_state()
     worker_positions = load_worker_positions()
     worker_trade_log = load_worker_trade_log(limit=50)
+    worker_metrics = worker_validation_summary(worker_trade_log)
 
     with st.sidebar:
         with st.expander("Background Worker", expanded=False):
@@ -2350,6 +2522,7 @@ def main() -> None:
                     st.warning("Worker disabled.")
             st.write(f"**Open Positions:** {len(worker_positions)}")
             st.write(f"**Worker Daily P&L:** ₹{float(worker_state.get('daily_pnl', 0.0)):,.2f}")
+            st.write(f"**Worker rejections today:** {int(worker_metrics['rejections_today'])}")
 
     live_tab, backtest_tab, chain_tab, notes_tab, help_tab = st.tabs(
         ["Live Signals", "Backtest", "Option Chain", "Live Wiring Notes", "Help"]
@@ -2382,35 +2555,14 @@ def main() -> None:
             vix_now = float(vix_df["Close"].iloc[-1])
             vix_prev = float(vix_df["Close"].iloc[-2]) if len(vix_df) > 1 else None
 
-        signal = build_signal(price_df, vix_now, vix_prev, cfg)
+        signal_eval = evaluate_signal(price_df, vix_now, vix_prev, cfg)
+        signal = signal_eval.signal
         chain_filter_result: Optional[ChainFilterResult] = None
-        no_trade_reason: Optional[str] = None
-        if signal is not None and cfg.use_option_chain_filter:
-            option_strike = choose_strike(signal.entry, signal.side, cfg.option_moneyness, cfg.strike_step)
-            try:
-                chain_expiries = load_option_chain_expiries(
-                    cfg.underlying_symbol,
-                    cfg.underlying_exchange_segment,
-                )
-                selected_chain_expiry = resolve_chain_expiry(expiry_code, chain_expiries)
-                if not selected_chain_expiry:
-                    chain_filter_result = ChainFilterResult(False, "No Dhan option-chain expiry is available for this instrument.")
-                else:
-                    chain_payload = load_option_chain_payload(
-                        cfg.underlying_symbol,
-                        cfg.underlying_exchange_segment,
-                        selected_chain_expiry,
-                    )
-                    chain_filter_result = evaluate_option_chain_filter(chain_payload, signal, option_strike, cfg)
-            except Exception as exc:
-                chain_filter_result = ChainFilterResult(False, f"Option-chain filter failed: {exc}")
-
-            if chain_filter_result and chain_filter_result.passes:
-                signal.confidence = round(min(signal.confidence + cfg.option_chain_confidence_bonus, 0.99), 3)
-                signal.reason = f"{signal.reason} | {chain_filter_result.reason}"
-            elif chain_filter_result:
-                no_trade_reason = chain_filter_result.reason
-                signal = None
+        rejection_reasons = list(signal_eval.rejections)
+        if signal is not None:
+            signal, chain_filter_result, chain_rejection = apply_chain_filter_to_signal(signal, expiry_code, cfg)
+            if chain_rejection:
+                rejection_reasons.append(chain_rejection)
         current_regime = detect_regime(vix_now, vix_prev, cfg)
 
         c1, c2, c3, c4 = st.columns(4)
@@ -2432,12 +2584,12 @@ def main() -> None:
 
         st.markdown("### Live Signal")
         if signal is None:
-            if vix_now < cfg.min_vix_trade_threshold:
-                st.info(f"No trade: India VIX {vix_now:.2f} is below the trade threshold of {cfg.min_vix_trade_threshold:.2f}.")
-            elif no_trade_reason:
-                st.info(f"No trade: {no_trade_reason}")
+            if rejection_reasons:
+                st.info(f"No trade: {rejection_reasons[0]['reason']}")
             else:
                 st.info("No valid CE/PE setup right now. Stay flat.")
+            st.markdown("#### Why No Trade")
+            st.dataframe(summarize_rejections(rejection_reasons), use_container_width=True, hide_index=True)
         else:
             option_symbol = make_option_symbol(
                 signal.entry,
@@ -2469,6 +2621,21 @@ def main() -> None:
             if qty <= 0:
                 ok = False
                 reason = "Capital allocation cap too small for one lot"
+            signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
+            risk_reject = risk_rejection(
+                signal,
+                st.session_state.day_start_capital,
+                st.session_state.daily_pnl,
+                trades_today,
+                st.session_state.loss_streak,
+                qty,
+                signal_key,
+                st.session_state.last_signal_key,
+                cfg,
+                kill_switch_active=kill_switch_active,
+            )
+            if risk_reject:
+                rejection_reasons.append(risk_reject)
 
             with st.container(border=True):
                 st.subheader(f"{signal.side} Signal")
@@ -2484,8 +2651,10 @@ def main() -> None:
                 st.write(f"**Risk Check:** {reason}")
                 if chain_filter_result:
                     st.write(f"**Option Chain Filter:** {chain_filter_result.reason}")
+                if rejection_reasons:
+                    st.markdown("#### Why No Trade")
+                    st.dataframe(summarize_rejections(rejection_reasons), use_container_width=True, hide_index=True)
 
-                signal_key = f"{signal.timestamp}_{signal.side}_{round(signal.entry, 2)}"
                 can_fire = (
                     ok
                     and not kill_switch_active
@@ -2657,6 +2826,12 @@ def main() -> None:
         worker_summary_cols[1].metric("Worker Open Positions", len(worker_positions))
         worker_summary_cols[2].metric("Worker Daily P&L", f"₹{float(worker_state.get('daily_pnl', 0.0)):,.2f}")
         worker_summary_cols[3].metric("Worker Loss Streak", str(worker_state.get("loss_streak", 0)))
+        validation_cols = st.columns(5)
+        validation_cols[0].metric("Entries Today", int(worker_metrics["entries_today"]))
+        validation_cols[1].metric("Rejections Today", int(worker_metrics["rejections_today"]))
+        validation_cols[2].metric("Win Rate", f"{worker_metrics['win_rate'] * 100:.1f}%")
+        validation_cols[3].metric("Avg P&L/Trade", f"₹{worker_metrics['avg_realized_pnl']:,.2f}")
+        validation_cols[4].metric("Avg Hold", f"{worker_metrics['avg_hold_minutes']:.1f} min")
         st.caption(
             f"Heartbeat: {format_ist_timestamp(worker_state.get('last_heartbeat')) or 'Never'} | "
             f"Last action: {worker_state.get('last_action') or 'None'}"
@@ -2679,6 +2854,15 @@ def main() -> None:
             st.dataframe(worker_trade_log_df.tail(20), use_container_width=True)
         else:
             st.write("Worker trade log is empty.")
+
+        st.markdown("### Paper Validation Checklist")
+        checklist = pd.DataFrame([
+            {"Check": "Several paper sessions completed", "Status": "OK" if worker_metrics["entries_today"] >= 1 else "Pending"},
+            {"Check": "Positive expectancy after costs", "Status": "OK" if worker_metrics["avg_realized_pnl"] > 0 else "Pending"},
+            {"Check": "Trade frequency is acceptable", "Status": "OK" if 1 <= worker_metrics["entries_today"] <= 3 else "Review"},
+            {"Check": "No repeated liquidity/spread failures", "Status": "Review"},
+        ])
+        st.dataframe(checklist, use_container_width=True, hide_index=True)
 
         st.markdown("### Recent Price Data")
         recent_session_df = price_df.copy()
@@ -2862,9 +3046,24 @@ def main() -> None:
                     k4.metric("Return", f"{stats['return_pct'] * 100:.2f}%")
                     pf = stats['profit_factor'] if math.isfinite(stats['profit_factor']) else 999.0
                     k5.metric("Profit Factor", f"{pf:.2f}")
+                    d1, d2, d3, d4 = st.columns(4)
+                    d1.metric("Signals", stats.get("signal_count", 0))
+                    d2.metric("Executed Trades", stats.get("executed_trade_count", 0))
+                    d3.metric("Avg Hold", f"{stats.get('avg_hold_minutes', 0.0):.1f} min")
+                    d4.metric("Trades/Day", f"{stats.get('avg_trades_per_day', 0.0):.2f}")
                     st.write(f"**Gross P&L:** ₹{stats['gross_pnl']:,.2f}")
                     st.write(f"**Estimated Costs:** ₹{stats['total_costs']:,.2f}")
                     st.write(f"**Max Drawdown:** {stats['max_drawdown_pct'] * 100:.2f}%")
+                    rejection_counts = stats.get("rejection_counts", {})
+                    if rejection_counts:
+                        st.write("**Rejection Counts:**")
+                        st.dataframe(
+                            pd.DataFrame(
+                                [{"code": code, "count": count} for code, count in rejection_counts.items()]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
                     if not trades_df.empty:
                         display_trades_df = trades_df.tail(100).copy()
                         for col in ("entry_time", "exit_time"):
@@ -2876,6 +3075,13 @@ def main() -> None:
                         st.line_chart(equity)
                     else:
                         st.info("No trades generated in the selected backtest window.")
+                    debug_df = stats.get("debug_df")
+                    if isinstance(debug_df, pd.DataFrame) and not debug_df.empty:
+                        display_debug_df = debug_df.tail(100).copy()
+                        if "timestamp" in display_debug_df.columns:
+                            display_debug_df["timestamp"] = display_debug_df["timestamp"].apply(format_ist_timestamp)
+                        st.markdown("#### Backtest Signal Diagnostics")
+                        st.dataframe(display_debug_df, use_container_width=True, hide_index=True)
 
     with chain_tab:
         st.markdown("### Dhan Option Chain")

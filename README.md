@@ -1,6 +1,6 @@
 # PowerScalper
 
-PowerScalper is a Streamlit app for index options signal generation, paper trading, backtesting, and staged Dhan live-trading integration.
+PowerScalper is a Streamlit app for selective index-options scalping, paper trading, backtesting, and staged Dhan live-trading integration.
 
 The project currently runs from a single main file: [live_trading_system.py](/Users/prithwish/Documents/Trading%20Code/PowerScalper/live_trading_system.py).
 
@@ -27,6 +27,16 @@ Supported instruments in the current app:
 - `SENSEX`
 
 ## Current Trading Model
+
+This app is now tuned first for selective `NIFTY 50` scalping in paper mode before any live pilot.
+
+The intended operating profile is:
+
+- primary instrument: `NIFTY 50`
+- target frequency: roughly `1` to `3` trades per day
+- bar interval: `5m`
+- hold time: roughly `5` to `15` minutes
+- execution style: buy `ATM` or near-ATM option premium with strict risk caps
 
 This app is designed around long option premium trades:
 
@@ -60,7 +70,7 @@ The app includes the following controls:
 - risk per trade capped to `1%` to `2%` of capital
 - premium stop loss in the `20%` to `30%` range
 - premium target in the `40%` to `60%` range
-- max holding time, default `30` minutes
+- max holding time, default `10` minutes
 - max daily loss limit
 - consecutive loss kill switch
 - max trades per day
@@ -126,12 +136,15 @@ The app currently has five tabs:
 Use this tab to:
 
 - view the latest signal
+- see the active rejection reason when no trade is taken
+- inspect the `Why No Trade` diagnostics table for the current cycle
 - inspect confidence, regime, stop, target, and suggested quantity
 - place paper orders
 - place live orders when enabled and confirmed
 - monitor open positions
 - manually exit positions
 - review the session trade log
+- review worker validation metrics and the paper-validation checklist
 
 ### 2. `Backtest`
 
@@ -142,6 +155,8 @@ Use this tab to:
 - tune confidence, filters, slippage, and costs
 - run a backtest
 - inspect trades, PnL, drawdown, profit factor, and equity curve
+- inspect signal counts, executed trades, rejection counts, average hold time, and trades/day
+- review a lightweight signal-diagnostics table to see why candidates were rejected
 
 ### 3. `Option Chain`
 
@@ -164,7 +179,7 @@ Use this tab for a short in-app operating guide and a link to the full repo docu
 
 The main sidebar exposes the operating controls for the strategy:
 
-- instrument
+- instrument, with `NIFTY 50` as the default
 - trading mode: `PAPER` or `LIVE`
 - capital
 - `SL %`
@@ -181,6 +196,7 @@ The main sidebar exposes the operating controls for the strategy:
 - history period
 - strike selection
 - expiry code
+- live preset, with `Selective NIFTY Scalp` as the default
 
 ## How To Run
 
@@ -209,12 +225,13 @@ Streamlit will print a local URL in the terminal. Open that URL in your browser.
 
 1. Start the app.
 2. Keep trading mode on `PAPER`.
-3. Choose the instrument and expiry code.
-4. Set capital and risk controls.
-5. Review the live signal.
-6. If a valid signal appears and the risk check is `OK`, execute the paper order.
-7. Monitor open positions and trade log.
-8. Let the system hit stop, target, or time exit, or exit manually.
+3. Keep the instrument on `NIFTY 50` unless you are explicitly testing another index.
+4. Use the `Selective NIFTY Scalp` live preset as the starting point.
+5. Set capital and risk controls.
+6. Review the live signal or the `Why No Trade` panel.
+7. If a valid signal appears and the risk check is `OK`, execute the paper order.
+8. Monitor open positions, worker metrics, and trade log.
+9. Let the system hit stop, target, or time exit, or exit manually.
 
 ### Basic backtest workflow
 
@@ -223,7 +240,18 @@ Streamlit will print a local URL in the terminal. Open that URL in your browser.
 3. Choose a preset.
 4. Adjust slippage and costs if needed.
 5. Run the backtest.
-6. Review trades, drawdown, return, and profit factor before changing live settings.
+6. Review trades, signal count, rejection counts, hold time, and trades/day before changing live settings.
+7. Treat the backtest as a tuning tool, not proof of live scalp profitability.
+
+## Paper Validation Checklist
+
+Before trying a small live pilot, use paper mode to confirm:
+
+- several sessions have completed without repeated data or execution failures
+- paper expectancy is positive after estimated costs
+- trade frequency is acceptable for the session style you want
+- liquidity and spread rejections are not dominating the day
+- stop, target, and time exits behave as expected
 
 ## Dhan Secrets Setup
 

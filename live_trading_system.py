@@ -487,7 +487,7 @@ def historical_security_id_candidates(
     instrument_name: Optional[str] = None,
     underlying_symbol: Optional[str] = None,
 ) -> list[int]:
-    candidates: list[int] = [int(security_id)]
+    candidates: list[int] = []
     meta = instrument_meta_for_strategy(
         instrument_name=instrument_name,
         underlying_symbol=underlying_symbol,
@@ -497,6 +497,8 @@ def historical_security_id_candidates(
         dominant_id = dominant_underlying_security_id(symbol)
         if dominant_id is not None:
             candidates.append(int(dominant_id))
+    candidates.append(int(security_id))
+    if symbol:
         if meta:
             candidates.append(int(meta["underlying_security_id"]))
     deduped: list[int] = []
@@ -520,7 +522,7 @@ def normalize_strategy_kwargs(strategy: Optional[dict[str, Any]]) -> dict[str, A
         (name for name, instrument in INSTRUMENTS.items() if instrument is meta),
         payload.get("instrument_name", "NIFTY 50"),
     )
-    payload["underlying_security_id"] = meta["underlying_security_id"]
+    payload["underlying_security_id"] = dominant_underlying_security_id(meta["underlying_symbol"]) or meta["underlying_security_id"]
     payload["option_prefix"] = meta["option_prefix"]
     payload["underlying_symbol"] = meta["underlying_symbol"]
     payload["order_exchange_segment"] = meta["order_exchange_segment"]

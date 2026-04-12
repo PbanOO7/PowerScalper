@@ -127,6 +127,8 @@ def run_worker_cycle() -> int:
             cfg.underlying_exchange_segment,
             cfg.bar_interval,
             cfg.history_period,
+            instrument_name=cfg.instrument_name,
+            underlying_symbol=cfg.underlying_symbol,
             broker=broker if isinstance(broker, DhanBroker) else None,
         )
         vix_df = fetch_vix_data(broker=broker if isinstance(broker, DhanBroker) else None)

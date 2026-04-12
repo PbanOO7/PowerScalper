@@ -470,6 +470,42 @@ def instrument_meta_for_strategy(
     return None
 
 
+def dominant_underlying_security_id(underlying_symbol: str) -> Optional[int]:
+    instruments = load_dhan_instrument_master()
+    matches = instruments[instruments["UNDERLYING_SYMBOL"] == underlying_symbol.upper()]
+    if matches.empty:
+        return None
+    counts = matches["UNDERLYING_SECURITY_ID"].dropna().astype(int).value_counts()
+    if counts.empty:
+        return None
+    return int(counts.index[0])
+
+
+def historical_security_id_candidates(
+    security_id: int,
+    *,
+    instrument_name: Optional[str] = None,
+    underlying_symbol: Optional[str] = None,
+) -> list[int]:
+    candidates: list[int] = [int(security_id)]
+    meta = instrument_meta_for_strategy(
+        instrument_name=instrument_name,
+        underlying_symbol=underlying_symbol,
+    )
+    symbol = underlying_symbol or (meta["underlying_symbol"] if meta else None)
+    if symbol:
+        dominant_id = dominant_underlying_security_id(symbol)
+        if dominant_id is not None:
+            candidates.append(int(dominant_id))
+        if meta:
+            candidates.append(int(meta["underlying_security_id"]))
+    deduped: list[int] = []
+    for candidate in candidates:
+        if candidate not in deduped:
+            deduped.append(candidate)
+    return deduped
+
+
 def normalize_strategy_kwargs(strategy: Optional[dict[str, Any]]) -> dict[str, Any]:
     payload = dict(strategy or {})
     meta = instrument_meta_for_strategy(
@@ -879,6 +915,9 @@ class DhanBroker(BrokerInterface):
         raise RuntimeError(f"No Dhan instrument metadata configured for option prefix `{option_prefix}`.")
 
     def resolve_underlying_security_id(self, underlying_symbol: str) -> int:
+        dominant_id = dominant_underlying_security_id(underlying_symbol)
+        if dominant_id is not None:
+            return int(dominant_id)
         meta = self._instrument_meta_from_prefix(underlying_symbol)
         return int(meta["underlying_security_id"])
 
@@ -2059,6 +2098,8 @@ def fetch_price_data(
     period: str,
     instrument: str = "INDEX",
     *,
+    instrument_name: Optional[str] = None,
+    underlying_symbol: Optional[str] = None,
     broker: Optional[DhanBroker] = None,
 ) -> pd.DataFrame:
     broker = broker or get_dhan_broker()
@@ -2077,14 +2118,24 @@ def fetch_price_data(
     else:
         fetch_interval = interval.replace("m", "")
 
-    df = broker.get_historical_data(
+    candidates = historical_security_id_candidates(
         security_id,
-        exchange_segment,
-        instrument,
-        interval=fetch_interval,
-        from_dt=from_dt,
-        to_dt=to_dt,
-    )
+        instrument_name=instrument_name,
+        underlying_symbol=underlying_symbol,
+    ) if instrument == "INDEX" else [int(security_id)]
+
+    df = pd.DataFrame()
+    for candidate_id in candidates:
+        df = broker.get_historical_data(
+            candidate_id,
+            exchange_segment,
+            instrument,
+            interval=fetch_interval,
+            from_dt=from_dt,
+            to_dt=to_dt,
+        )
+        if not df.empty:
+            break
     if df.empty:
         return df
     df = normalize_intraday_data(df)
@@ -2111,8 +2162,18 @@ def load_price_data(
     interval: str,
     period: str,
     instrument: str = "INDEX",
+    instrument_name: Optional[str] = None,
+    underlying_symbol: Optional[str] = None,
 ) -> pd.DataFrame:
-    return fetch_price_data(security_id, exchange_segment, interval, period, instrument)
+    return fetch_price_data(
+        security_id,
+        exchange_segment,
+        interval,
+        period,
+        instrument,
+        instrument_name=instrument_name,
+        underlying_symbol=underlying_symbol,
+    )
 
 
 def fetch_vix_data(period: str = "1y", *, broker: Optional[DhanBroker] = None) -> pd.DataFrame:
@@ -2540,6 +2601,8 @@ def main() -> None:
             cfg.underlying_exchange_segment,
             cfg.bar_interval,
             cfg.history_period,
+            instrument_name=cfg.instrument_name,
+            underlying_symbol=cfg.underlying_symbol,
         )
         vix_df = load_vix_data()
 
@@ -3004,6 +3067,8 @@ def main() -> None:
                 cfg.underlying_exchange_segment,
                 bt_interval,
                 bt_period,
+                instrument_name=cfg.instrument_name,
+                underlying_symbol=cfg.underlying_symbol,
             )
             bt_vix = load_vix_data()
             bt_cfg = StrategyConfig(
